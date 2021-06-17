@@ -26,7 +26,7 @@ REQUIRED = [
     "coloredlogs",
     "requests",
     "web3",
-    "timeout_decorator",
+    "wrapt_timeout_decorator",
     "appdirs",
 ]
 
