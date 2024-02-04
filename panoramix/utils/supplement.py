@@ -8,6 +8,7 @@ from pathlib import Path
 from zipfile import ZipFile
 from typing import Optional
 import shelve
+import dbm
 from panoramix.utils.helpers import (
     cache_dir,
     cached,
@@ -47,7 +48,7 @@ def abi_path():
 
 
 def check_supplements():
-    if not abi_path().is_file():
+    if not dbm.whichdb(str(abi_path())):
         compressed_supplements = Path(__file__).parent.parent / "data" / "abi_dump.xz"
         logger.info("Loading %s into %s...", compressed_supplements, abi_path())
         with lzma.open(compressed_supplements) as inf, shelve.open(
@@ -58,7 +59,7 @@ def check_supplements():
                 selector, abi = line["selector"], line["abi"]
                 out[selector] = abi
 
-        assert abi_path().is_file()
+        assert dbm.whichdb(str(abi_path()))
 
         logger.info("%s is ready.", abi_path())
 
