@@ -15,7 +15,7 @@ The code quality is still not great and the software is complex, it's mostly res
 
 ```console
 $ pip install panoramix-decompiler
-```
+```$ pip install panoramix-decompiler
 
 ## Running
 
@@ -23,7 +23,7 @@ You can specify a web3 provider using the environment variable `WEB3_PROVIDER_UR
 
 ```console
 $ WEB3_PROVIDER_URI=http://localhost:7545 panoramix 0x0d94D81FD712126E7f320b5B10537D01d6a01563
-```
+```$ WEB3_PROVIDER_URI=http://localhost:7545 panoramix 0x0d94D81FD712126E7f320b5B10537D01d6a01563
 
 You can also provide the bytecode for decompilation.
 
@@ -44,7 +44,7 @@ Here is an example for cryptokitties: https://oko.palkeo.com/0x06012c8cf97BEaD5d
 Windows is not supported currently.
 
 ## Changelog
-
+http://localhost:7545$ panoramix 6004600d60003960046000f30011223344
 ### 0.5.0
 
  * Added support for the BASEFEE opcode.
