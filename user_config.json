@@ -1,0 +1,53 @@
+{
+  "AccountIndex" : 1190988,
+  "AccountIdHash" : "1584f252bf14683834f8974aeff490e005b932d7d5ebdfa3ab3d9a0d8aecf59e",
+  "TotalEquity" : 5082720758536000,
+  "TotalDebt" : 0,
+  "Assets" : [ {
+    "Index" : 0,
+    "Equity" : 12,
+    "Debt" : 0
+  }, {
+    "Index" : 1,
+    "Equity" : 228,
+    "Debt" : 0
+  }, {
+    "Index" : 2,
+    "Equity" : 1441,
+    "Debt" : 0
+  }, {
+    "Index" : 7,
+    "Equity" : 1646814,
+    "Debt" : 0
+  }, {
+    "Index" : 8,
+    "Equity" : 254439,
+    "Debt" : 0
+  }, {
+    "Index" : 9,
+    "Equity" : 47744,
+    "Debt" : 0
+  }, {
+    "Index" : 14,
+    "Equity" : 1911754,
+    "Debt" : 0
+  }, {
+    "Index" : 45,
+    "Equity" : 23821,
+    "Debt" : 0
+  }, {
+    "Index" : 98,
+    "Equity" : 122973,
+    "Debt" : 0
+  }, {
+    "Index" : 113,
+    "Equity" : 1000000,
+    "Debt" : 0
+  }, {
+    "Index" : 287,
+    "Equity" : 7610403,
+    "Debt" : 0
+  } ],
+  "Root" : "1cfc2b83dcff24d4c0cd17823f7aa4109e80e98f7ff45f22e4132b22ca3d45ee",
+  "Proof" : [ "Locox4N7hQMsMnIOgUfmL+8ONXa8Cdrgdrb8qw+h6fo=", "Iju9j5cYIpT7knokfddHtaXLzsKhuEt5rbwSTWO+RVc=", "BHQfFE7t6XHeDtgnQEJMmkWHGf1jo1DRXwpKgOXckd0=", "ID528ksokVUfPUZQyJMRo8vad6bNP6B0ayeSyQm1Vyw=", "Bpk5fIRu/6s1zAvATuIPpsYTGYYA+Gp0bfU8oAtSlpE=", "AJoC66F+ucfl+ea6B6nmNt0+B7n2JtdEyKAFROfZESU=", "HUgq2Cm9mtFPbreF3IyPy6/YVLn5zSpTljYFNQJeQHE=", "IP/9nTg4gu8pBWcp7J7wIBF6sQzxludJ6em+Bk3wkPU=", "HoN95WjSpjblkxcT88+o+P9FIVwulVufOqFoTU7rXO0=", "DLjUtSFwumlwRg59u9nEzJVK2//1sRjG1+NjOUSADEY=", "G77qrD2iwBaEl5wps6Bh7a3tBnDDglbmg/MxsJxEJQQ=", "K1NXKSa+jv/VK5vEQxctOp8VCzETCd/Qg2zMM5epbp0=", "HOqDI9bJZbvEIhA5LYJk5dX5wAuSU4aURNwAHEwSBHE=", "JI9sHyrKyZ3DxWtadYtHC3CgyYdYh0hUQPEL/JjGH0M=", "DVc7CwQMCzTtf4cCjAQIjFqoVNoIaCHLAK4YPj/zN0U=", "FAhByl0oaeAOwu3dtJ2WgNo4nas2GZGwDsj1D4Uoj/g=", "Kb9ljihpXyMzij80Wln5LujVB8cORoSB+UL/v2DFTAY=", "FFrPx6cgjSvVC94PVr4WXjKYi+8vbHX1MXYJ3HBs2xM=", "F4Gjf9zbNXmCZcoFuspLK1QjZWfPbAbTk3DYk3qyCVk=", "LUR0/S2b/TMHw7anM39lZ9otMqT7Z9B54OF7XEkVCGM=", "K1MaIqF4jAvxd63gVW8CTjL8yjL5fs1xxfoC1z4Cm+A=", "EmOOI9OrFEMZUh1B6RwqdVf4/k0owMGEJFKdGB7UKus=", "MEG97aAXue+YtkjLE6NvdFlDDx9J1dGnybMGmh4VVok=", "GuZE8TQ9okcWLXDEeZdasYDUr398j88TQGI8OaN2PL4=", "EFTsOjyRPGudok/0Sh5fNBWwhHvnwdqi6QYPKmCPTJ4=", "DUIiZ1vCrSRCOGSdvEYC++XmQgVv2YUG69yAA9kxPSM=", "G3j3tGx68tGwEASTdGp53FVLiVKbv9e6NAYoXXX919M=", "FZccOkiNSW8NLDCniDlhv5iB8nemSPBCGmovBe5UdBc=" ]
+}
