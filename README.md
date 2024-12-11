@@ -22,13 +22,13 @@ $ pip install panoramix-decompiler
 You can specify a web3 provider using the environment variable `WEB3_PROVIDER_URI`. In this case a local provider was set.
 
 ```console
-$ WEB3_PROVIDER_URI=http://localhost:7545 panoramix 0x0d94D81FD712126E7f320b5B10537D01d6a01563
+$ WEB3_PROVIDER_URI=http://localhost:7545 panoramix 0xFa1dB6794de6e994b60741DecaE0567946992181
 ```
 
 You can also provide the bytecode for decompilation.
 
 ```console
-$ panoramix 6004600d60003960046000f30011223344
+$ panoramix 0xFa1dB6794de6e994b60741DecaE0567946992181
 ```
 
 ## Examples
@@ -37,7 +37,7 @@ I have decompiled all of mainnet, and make sure to decompile again on the latest
 
 You can access decompilations using Oko: https://oko.palkeo.com/
 
-Here is an example for cryptokitties: https://oko.palkeo.com/0x06012c8cf97BEaD5deAe237070F9587f8E7A266d/code/
+Here is an example for cryptokitties: https://oko.palkeo.com/0xFa1dB6794de6e994b60741DecaE0567946992181/code/
 
 ## Caveats
 
