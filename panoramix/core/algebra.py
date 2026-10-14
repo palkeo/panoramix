@@ -18,9 +18,17 @@
 import numbers
 import logging
 
-from panoramix.core.variants import variants
+from panoramix.core import variants
 from panoramix.matcher import Any, match
-from panoramix.utils.helpers import EasyCopy, all_concrete, cached, opcode, to_exp2
+from panoramix.utils.helpers import (
+    CACHES,
+    EasyCopy,
+    all_concrete,
+    cached,
+    clear_caches,
+    opcode,
+    to_exp2,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,14 +39,478 @@ class CannotCompare(Exception):
 
 # copied from other modules, need to rework module structures
 # to avoid circular dependencies
+def _clamp_bits(k):
+    """
+    masks and shifts never exceed 256 bits, but a variant of an expression
+    (see variants.py) can put 2^230 there, and 2 ** that would exhaust the
+    memory
+    """
+    return max(min(k, 4096), -4096)
+
+
+def _pow2(k):
+    return 2 ** _clamp_bits(k)
+
+
 def mask_to_int(size, offset):
+    size = _clamp_bits(size)
+    offset = _clamp_bits(offset)
+
     if offset < 0:
         size = size + offset
         if size < 1:
             return 0
         return 2**size - 1
 
+    if size < 0:
+        return 0
+
     return (2**size - 1) * (2**offset)
+
+
+def may_be_wide(exp):
+    """
+    True if exp may have more than 256 bits: a value from memory can be
+    longer than a word (a string, the arguments of a call), and a mask of
+    256 bits of it doesn't leave it as it is.
+    """
+    if type(exp) == int:
+        return exp >= 2**256
+
+    op = opcode(exp)
+    if op == "data":
+        return True
+
+    if op == "bytes":
+        return not (type(exp[1]) == int and exp[1] <= 32)
+
+    if op == "mem" or op in (
+        "call.data",
+        "code.data",
+        "ext_call.return_data",
+        "delegate.return_data",
+        "callcode.return_data",
+        "staticcall.return_data",
+    ):
+        if op == "mem":
+            rng = exp[1]
+            length = rng[2] if opcode(rng) == "range" and len(rng) == 3 else None
+        else:
+            length = exp[2] if len(exp) == 3 else None
+        return not (type(length) == int and length <= 32)
+
+    return False
+
+
+# what no execution can make large: sizes of what gas pays for
+BOUNDED_SYMBOLS = {
+    "calldatasize": 64,
+    "returndatasize": 64,
+    "codesize": 64,
+    "msize": 64,
+    "gas": 64,
+}
+
+WORD_TOP = 2**256 - 1
+
+# the highest the words memory addresses and sizes are made of can be: gas
+# keeps them far below 2**256 (see memory_range)
+MEMORY_TOP = 2**64 - 1
+
+
+def value_range(exp, bounds=None, top=WORD_TOP):
+    """
+    (lowest, highest): what exp can be, as an integer - for any value of the
+    words it's made of (between 0 and top - 2**256 - 1, or MEMORY_TOP, see
+    memory_range - less for BOUNDED_SYMBOLS, and for what bounds says: {x:
+    (lowest, highest)}).
+
+    A sum or a product (add, mul) is the integer it is here: a sum of words
+    may be negative, or above 2**256. That's how the fields of a mask are
+    read (its size, offset and shift, see mask_op) - a word from the EVM is
+    one of them only when it's the same integer (see shl_op). Anything else
+    is a word.
+    """
+    return _value_range(exp, bounds, top)
+
+
+def memory_range(exp):
+    """
+    value_range of a memory address or size (or what's computed from them):
+    the words it's made of are below 2**64 - no execution can pay for the
+    memory of a larger one (the documented assumption of the memory model,
+    see memloc) - and it's the integer it is, not the word modulo 2**256.
+    """
+    return value_range(exp, top=MEMORY_TOP)
+
+
+@cached
+def _cached_value_range(exp, top):
+    return _value_range_of(exp, None, top)
+
+
+def _linear(exp, bounds, masks=True, top=WORD_TOP):
+    """
+    exp as a sum: ({term: coefficient}, constant, (lowest, highest) of a
+    number added to them). masks: floor32(x)... as x minus a number - or,
+    "exact", only 2 * x... (no number subtracted: two of them that are the
+    same mask stay the same term, and cancel each other).
+    """
+    if type(exp) in (int, bool):
+        return {}, int(exp), (0, 0)
+
+    op = opcode(exp)
+    if op == "add":
+        terms, const, lo, hi = {}, 0, 0, 0
+        for e in exp[1:]:
+            t, c, (d_lo, d_hi) = _linear(e, bounds, masks, top)
+            const, lo, hi = const + c, lo + d_lo, hi + d_hi
+            for k, v in t.items():
+                terms[k] = terms.get(k, 0) + v
+        return terms, const, (lo, hi)
+
+    if op == "mul" and len(exp) >= 3 and type(exp[1]) is int:
+        rest = exp[2] if len(exp) == 3 else ("mul",) + exp[2:]
+        k = exp[1]
+        t, c, (d_lo, d_hi) = _linear(rest, bounds, masks, top)
+        d = (k * d_lo, k * d_hi) if k >= 0 else (k * d_hi, k * d_lo)
+        return {x: v * k for x, v in t.items()}, c * k, d
+
+    if (
+        masks
+        and (m := match(exp, ("mask_shl", ":int:size", ":int:off", ":int:shl", ":x")))
+        and 0 < m.size
+        and 0 <= m.off <= 16
+        and (masks is True or m.off == 0)
+        and 0 <= m.shl
+    ):
+        # x with its lowest off bits cleared (floor32(x); ceil32(y) is
+        # floor32(y + 31)), times 2**shl (8 * x, a mask moved left by 3):
+        # 2**shl * (x - d), d its bits cleared, from 0 to 2**off - 1 - the
+        # same d for the same mask, wherever it is (2 * ceil32(x) - ceil32(x)
+        # is ceil32(x)), when the mask doesn't cut the top of x, nor the
+        # word the top of what it's moved to (32 * (i + 1), from Vyper)
+        lo, hi = _value_range(m.x, bounds, top)
+        if 0 <= lo and hi < 2 ** (m.off + m.size) and hi << m.shl <= WORD_TOP:
+            t, c, (d_lo, d_hi) = _linear(m.x, bounds, masks, top)
+            k = 2**m.shl
+            t = {x: v * k for x, v in t.items()}
+            if m.off:
+                t[("cleared", exp)] = t.get(("cleared", exp), 0) - k
+            return t, c * k, (k * d_lo, k * d_hi)
+
+    return {exp: 1}, 0, (0, 0)
+
+
+def _value_range(exp, bounds, top=WORD_TOP):
+    # (what's known of an expression is known of it wherever it is: each of
+    # its words, each of its terms is looked at once - not again in each of
+    # the passes of each sum it's in, an exponential number of times)
+    if not bounds:
+        return _cached_value_range(exp, top)
+    return _value_range_of(exp, bounds, top)
+
+
+def _value_range_of(exp, bounds, top=WORD_TOP):
+    # (the masks as numbers minus others know sums such as ceil32(x) - x,
+    # as what they are that each of them is a word, and with only the exact
+    # ones as numbers 2 * (ceil32(x) + 32) - ceil32(x): all of them hold)
+    ranges = [_sum_range(exp, bounds, m, top) for m in (True, "exact", False)]
+    return max(r[0] for r in ranges), min(r[1] for r in ranges)
+
+
+def _sum_range(exp, bounds, masks, top=WORD_TOP):
+    terms, const, (lo, hi) = _linear(exp, bounds, masks, top)
+    lo, hi = lo + const, hi + const
+    for t, c in terms.items():
+        if c == 0:
+            continue
+        t_lo, t_hi = _term_range(t, bounds, top)
+        if c > 0:
+            lo, hi = lo + c * t_lo, hi + c * t_hi
+        else:
+            lo, hi = lo + c * t_hi, hi + c * t_lo
+    return lo, hi
+
+
+def _word_top(exp, bounds, top=WORD_TOP):
+    """The highest value of exp as a word."""
+    lo, hi = _value_range(exp, bounds, top)
+    return hi if 0 <= lo and hi <= WORD_TOP else WORD_TOP
+
+
+def _term_range(t, bounds, top=WORD_TOP):
+    if not bounds:
+        return _cached_term_range(t, top)
+    return _term_range_of(t, bounds, top)
+
+
+@cached
+def _cached_term_range(t, top):
+    return _term_range_of(t, None, top)
+
+
+def _term_range_of(t, bounds, top=WORD_TOP):
+    """
+    value_range of what isn't a sum, nor a number times something. With a
+    top below WORD_TOP (see memory_range), a term of a memory address or
+    size is below it - what it's made of isn't: the top byte of a word, as
+    Solady's LibString.unpackTwo reads a length, is the byte it is. Nor is
+    a word made of a number below 0: 8 * (32 - x % 32) as 256 + Mask(253, 0,
+    3, -(x % 32)) is small only modulo 2**256, its mask is the large number
+    it is. Nor is one made of what the contract is given, unchecked (see
+    _of_unchecked) - unless it's a memory size itself, or checked to be
+    small (see set_variables).
+    """
+    lo, hi = _whole_term_range(t, bounds, top)
+    if (
+        top < WORD_TOP
+        and lo <= top
+        and (t in _SMALL or not (_of_wrapped(t, bounds) or _of_unchecked(t)))
+    ):
+        hi = min(hi, top)
+    return lo, hi
+
+
+def _of_wrapped(t, bounds):
+    """Whether t is a word made of what may not be one: a mask of -x..."""
+    if opcode(t) == "mask_shl" and len(t) == 5:
+        args = t[4:]
+    elif opcode(t) in ("div", "mod", "and", "or", "xor", "min", "max"):
+        args = t[1:]
+    else:
+        return False
+    for a in args:
+        lo, hi = (a, a) if type(a) is int else _value_range(a, bounds)
+        if lo < 0 or hi > WORD_TOP:
+            return True
+    return False
+
+
+# the words a contract is given - of its calldata, of what another one
+# returned - that may be anything: a memory address or size made of them may
+# wrap around 2**256 (see _of_unchecked), unless the contract checks them
+INPUTS = ("cd", "call.data", "ext_call.return_data")
+
+
+@cached
+def _of_unchecked(t):
+    """
+    Whether t is made of a word the contract is given (see unchecked): `p +
+    160`, with p a param added to a pointer, unchecked (Solady's
+    LibBytes.load), may wrap around 2**256 - mem[159] for a p of 2**256 - 1.
+    """
+    return unchecked(t, _VARIABLES, _SMALL)
+
+
+# what a word is computed from, its value made of theirs - not what's read
+# where they say, in storage, in memory...
+COMPUTED = (
+    ("add", "mul", "div", "sdiv", "mod", "smod", "exp", "addmod", "mulmod")
+    + ("signextend", "and", "or", "xor", "not", "mask_shl", "shl", "shr", "sar")
+    + ("byte", "clz", "min", "max", "bytes", "data")
+)
+
+
+def unchecked(exp, values, small):
+    """
+    Whether exp is made of a word the contract is given (INPUTS) that isn't
+    known to be small - in small (see set_variables) - computed from it
+    (COMPUTED), or a variable set to it: one of the values it's set to
+    (values, {name: [values]}).
+    """
+    seen = set()
+
+    def f(e):
+        if type(e) is not tuple or not e or e in small:
+            return False
+        if opcode(e) in INPUTS:
+            return True
+        if opcode(e) == "var" and len(e) == 2:
+            if e[1] in values and e[1] not in seen:
+                seen.add(e[1])
+                return any(f(v) for v in values[e[1]])
+            return False
+        return opcode(e) in COMPUTED and any(f(x) for x in e[1:])
+
+    return f(exp)
+
+
+# what the variables of the trace being simplified are set to (see
+# set_variables), the ones a value of which is made of them (a loop's
+# counter), and the ones whose values are being looked at - and the words
+# of it known to be small
+_VARIABLES = {}
+_CYCLIC = set()
+_VISITING = set()
+_SMALL = frozenset()
+
+
+def set_variables(values, small=()):
+    """
+    {name: [values]}: what each variable of the trace being simplified is set
+    to, anywhere in it - its value is one of these (see simplify_trace). And
+    small: the words of it below 2**64 wherever they're in a memory address
+    or size, as no other word the contract is given is (see
+    simplify.small_words). What was decided with others is forgotten
+    (clear_caches).
+    """
+    global _VARIABLES, _CYCLIC, _SMALL
+    _VARIABLES = values
+    _SMALL = frozenset(small)
+    _CYCLIC = set(
+        name
+        for name, vals in values.items()
+        if any(mentions_var(v, name) for v in vals)
+    )
+    clear_caches()
+
+
+def _whole_term_range(t, bounds, top=WORD_TOP):
+    if bounds and t in bounds:
+        return bounds[t]
+
+    if opcode(t) == "cleared":
+        # the bits a mask clears (see _linear)
+        return 0, 2 ** t[1][2] - 1
+
+    if (
+        opcode(t) == "var"
+        and len(t) == 2
+        and t[1] in _VARIABLES
+        and t[1] not in _CYCLIC
+        and t[1] not in _VISITING
+    ):
+        # one of the values it's set to - a snapshot of the free memory
+        # pointer is one, at least 0x60 - unless one of them is made of it (a
+        # loop's counter): then any word
+        _VISITING.add(t[1])
+        try:
+            ranges = [_value_range(v, bounds, top) for v in _VARIABLES[t[1]]]
+        finally:
+            _VISITING.discard(t[1])
+        lo, hi = min(r[0] for r in ranges), max(r[1] for r in ranges)
+        if 0 <= lo and hi <= WORD_TOP:
+            return lo, hi
+        return 0, WORD_TOP
+
+    if type(t) in (int, bool):
+        return int(t), int(t)
+
+    if type(t) is str:
+        return 0, 2 ** BOUNDED_SYMBOLS.get(t, 256) - 1
+
+    op = opcode(t)
+
+    if op in BOOL_OPS:
+        return 0, 1
+
+    if op == "mul":
+        # a product of what isn't numbers
+        lo = hi = 1
+        for f in t[1:]:
+            f_lo, f_hi = _value_range(f, bounds)
+            cands = (lo * f_lo, lo * f_hi, hi * f_lo, hi * f_hi)
+            lo, hi = min(cands), max(cands)
+        return lo, hi
+
+    if op == "clz":
+        # the leading zero bits of a word
+        return 0, 256
+
+    # the rest are words
+    if (m := match(t, ("mod", ":x", ":int:c"))) and 0 < m.c:
+        return 0, min(m.c - 1, _word_top(m.x, bounds))
+
+    if (m := match(t, ("div", ":x", ":int:c"))) and 0 < m.c:
+        return 0, _word_top(m.x, bounds) // m.c
+
+    if m := match(t, ("mod", Any, ":y")):
+        # below what it's divided by (0 by 0): an index, i % array.length
+        return 0, max(_word_top(m.y, bounds, top) - 1, 0)
+
+    if m := match(t, ("mask_shl", ":int:size", ":int:off", ":int:shl", ":x")):
+        high_bit = _clamp_bits(m.off + m.size)
+        if not may_be_wide(m.x):
+            high_bit = min(high_bit, _word_top(m.x, bounds).bit_length())
+        bottom = max(m.off, 0)
+        if high_bit <= bottom:
+            return 0, 0
+        high = 2**high_bit - 2**bottom
+        high = high << _clamp_bits(m.shl) if m.shl >= 0 else high >> -m.shl
+        return 0, min(high, WORD_TOP)
+
+    if (m := match(t, ("storage", ":int:size", ":int:off", Any))) and m.off >= 0:
+        return 0, 2 ** max(0, min(m.size, 256)) - 1
+
+    if t == ("mem", ("range", 64, 32)) and variants.FREE_MEMORY_POINTER:
+        # solidity's free memory pointer: 0x80 from the start on (0x60 before
+        # 0.4.22), and above as it's moved
+        return 0x60, WORD_TOP
+
+    if op == "and" and len(t) > 1:
+        return 0, min(_word_top(e, bounds) for e in t[1:])
+
+    if op in ("or", "xor") and len(t) > 1:
+        bits = max(_word_top(e, bounds).bit_length() for e in t[1:])
+        return 0, 2**bits - 1
+
+    if op in ("min", "max") and len(t) > 1:
+        ranges = [_value_range(e, bounds) for e in t[1:]]
+        if all(0 <= lo and hi <= WORD_TOP for lo, hi in ranges):
+            pick = min if op == "min" else max
+            return pick(r[0] for r in ranges), pick(r[1] for r in ranges)
+
+    return 0, WORD_TOP
+
+
+def mentions_var(exp, name):
+    """Whether exp reads the variable, or one whose values do (see set_variables)."""
+    seen = set()
+
+    def f(e):
+        if type(e) is not tuple:
+            return False
+        if opcode(e) == "var" and len(e) == 2:
+            if e[1] == name:
+                return True
+            if e[1] in _VARIABLES and e[1] not in seen:
+                seen.add(e[1])
+                return any(f(v) for v in _VARIABLES[e[1]])
+            return False
+        return any(f(x) for x in e[1:])
+
+    return f(exp)
+
+
+def is_word(exp, bounds=None):
+    """Whether exp, as an integer (see value_range), is a word."""
+    lo, hi = value_range(exp, bounds)
+    return 0 <= lo and hi <= WORD_TOP
+
+
+def shift_sign(exp):
+    """
+    1 if exp, as an integer (see value_range), is a word (a shift left by
+    it), -1 if minus it is (a shift right), 0 if it's 0, None if it's not
+    known which.
+    """
+    if exp == 0:
+        return 0
+    lo, hi = value_range(exp)
+    if 0 <= lo and hi <= WORD_TOP:
+        return 1
+    if -WORD_TOP <= lo and hi <= 0:
+        return -1
+    return None
+
+
+def readable_mask(size, offset, shl):
+    """
+    Whether a mask with these can be printed as what it is: its size and
+    offset words, and its shift one way or the other (see shift_sign).
+    """
+    return is_word(size) and is_word(offset) and shift_sign(shl) is not None
 
 
 @cached
@@ -65,7 +537,7 @@ def simplify(exp):
         if all_concrete(size, offset, shl, val):
             return apply_mask(val, size, offset, shl)
 
-        if (size, offset, shl) == (256, 0, 0):
+        if (size, offset, shl) == (256, 0, 0) and not may_be_wide(val):
             return val
 
     if opcode(exp) == "add":
@@ -102,43 +574,6 @@ def calc_max(exp):
             return m
 
     return exp
-
-
-@cached
-def add_ge_zero(exp):
-    """
-    technically, it can return wrong results, e.g.:
-
-    (sub (mask 4, 4, -4, 'sth') (mask 4, 0, 'sth'))
-    for sth 11...111 == 0
-    for sth 0 == 0
-    for sth 00010011 < 0
-
-    in practice it (hopefully) doesn't happen -- need to fix "variants"
-    to deliver more variants based on masks and other expressions?
-
-    """
-
-    assert opcode(exp) == "add", exp
-    assert len(exp) > 2, exp
-
-    exp = simplify(exp)
-    if type(exp) == int:
-        return exp >= 0
-
-    #    print(exp)
-    var = tuple(simplify(calc_max(e)) for e in variants(exp))
-
-    if not all_concrete(*var):
-        return None
-
-    if all(v >= 0 for v in var):
-        return True
-
-    if all(v < 0 for v in var):
-        return False
-
-    return None
 
 
 def minus_op(exp):
@@ -325,6 +760,17 @@ def add_op(*args):
 
 
 def bits(exp):
+    """The number of bits in exp bytes."""
+    if opcode(exp) == "add":
+        # a size, too small to overflow: the bits of the terms add up
+        return add_op(*[bits(e) for e in exp[1:]])
+
+    if (m := match(exp, ("mul", ":int:k", ":x"))) and m.k < 0:
+        # a term subtracted: minus the bits of what's subtracted - not 8 times
+        # the word of a negative number (a mask of it: 256 + Mask(253, 0, 3,
+        # -x) for 32 - x, which is 256 - 8 * x only modulo 2**256)
+        return minus_op(bits(m.x if m.k == -1 else mul_op(-m.k, m.x)))
+
     return mul_op(exp, 8)
 
 
@@ -395,32 +841,41 @@ def mul_op(*args):
         ) + symbolic
 
 
-def get_sign(exp):
+def get_sign(exp, top=WORD_TOP):
+    """
+    1 if exp > 0, -1 if exp < 0, 0 if it's 0 - as the integer it is, for any
+    value of what it's made of (see value_range, and top there) - None if
+    that depends on them.
+    """
     if exp == 0:
         return 0
 
-    elif ge_zero(sub_op(exp, 1)) == True:
+    lo, hi = value_range(exp, top=top)
+    if lo > 0:
         return 1
-
-    elif ge_zero(exp) == False:
+    if hi < 0:
         return -1
-
-    else:
-        return None
-
-
-def safe_gt_zero(exp):
-    return safe_ge_zero(sub_op(exp, 1))
+    if lo == hi == 0:
+        return 0
+    return None
 
 
-def safe_ge_zero(exp):
+def safe_gt_zero(exp, top=WORD_TOP):
+    return safe_ge_zero(sub_op(exp, 1), top)
+
+
+def safe_ge_zero(exp, top=WORD_TOP):
     try:
-        return ge_zero(exp)
+        return ge_zero(exp, top)
     except CannotCompare:
         return None
 
 
 def to_bytes(exp):
+    """
+    exp bits, as (bytes, bits left over): the bits left over are None if
+    it isn't known whether exp is a whole number of bytes.
+    """
     if type(exp) == int:
         return (exp + 7) // 8, exp % 8
 
@@ -429,37 +884,35 @@ def to_bytes(exp):
 
     if (
         m := match(exp, ("mask_shl", ":int:size", ":int:offset", ":int:shl", ":val"))
-    ) and m.shl >= 3:
+    ) and m.offset + m.shl >= 3:
+        # the lowest 3 bits are 0
         return ("mask_shl", m.size, m.offset, m.shl - 3, m.val), 0
 
-    if opcode(exp) == "mul" and len(exp) == 3:
+    if opcode(exp) == "mul" and len(exp) == 3 and type(exp[1]) == int:
         if exp[1] % 8 == 0:
-            return to_bytes(exp[1])
+            return ("mul", exp[1] // 8, exp[2]), 0
 
     if opcode(exp) == "add":
         res = []
         for e in exp[1:]:
-            if type(e) == int or opcode(e) == "mask_shl":
-                by, bi = to_bytes(e)
-                if bi == 0:
-                    res.append(by)
-                else:
-                    raise NotImplementedError(exp)
-
-            elif opcode(e) == "mul" and len(e) == 3:
-                if e[1] % 8 == 0:
-                    res.append(("mul", e[1] // 8, e[2]))
-                elif opcode(e[2]) == "mask_shl" and e[2][:4] == ("mask_shl", 253, 0, 3):
-                    res.append(("mul", e[1], e[2][4]))
-                else:
-                    raise NotImplementedError(exp)
-
+            if (
+                opcode(e) == "mul"
+                and len(e) == 3
+                and type(e[1]) == int
+                and opcode(e[2]) == "mask_shl"
+                and e[2][:4] == ("mask_shl", 253, 0, 3)
+            ):
+                by, bi = ("mul", e[1], e[2][4]), 0
             else:
-                raise NotImplementedError(exp)
+                by, bi = to_bytes(e)
+
+            if bi != 0:
+                return mask_op(exp, shr=3), None
+            res.append(by)
 
         return ("add",) + tuple(res), 0
 
-    return mask_op(exp, shr=3), 0
+    return mask_op(exp, shr=3), None
 
 
 def divisible_bytes(exp):
@@ -479,64 +932,31 @@ assert to_bytes(
 ) == (("add", ("cd", ("add", 4, ("cd", 36))), ("mul", -1, ("add", 36, ("cd", 36)))), 0)
 
 
-ge_zero_cache = {}
+def ge_zero(exp, top=WORD_TOP):
+    """
+    True if exp >= 0, False if exp < 0 - as the integer it is, for any value
+    of what it's made of (see value_range; top: MEMORY_TOP for memory
+    addresses and sizes, see memory_range) - CannotCompare if that depends on
+    them.
 
-
-def ge_zero(exp):
-    if type(exp) == int:
-        return exp >= 0
-
-    if exp in ge_zero_cache:
-        if ge_zero_cache[exp] is None:
-            raise CannotCompare
-        return ge_zero_cache[exp]
-
-    ge_zero_cache[exp] = _ge_zero(exp)
-    if ge_zero_cache[exp] is None:
-        raise CannotCompare
-    return ge_zero_cache[exp]
-
-
-def _ge_zero(exp):
-    # returns True if exp>=0, False if exp<=0, CannotCompare if it doesn't know
-
+    The comparisons (le_op, lt_op, max_op...) are decided so, and nothing
+    else: a sign found by trying values - 0 and 2**230 for each word, as it
+    was - is of these values only (the top byte of a word is 0 in both).
+    """
     if type(exp) in (int, float):
         return exp >= 0
 
-    if type(exp) == str:
+    lo, hi = value_range(exp, top=top)
+    if lo >= 0:
         return True
-
-    if opcode(exp) == "mul":
-        counter = 1
-        for e in exp[1:]:
-            c = ge_zero(e)
-            if c == True:
-                counter *= 1
-            elif c == False:
-                counter *= -1
-
-        return counter >= 0
-
-    if opcode(exp) == "bool":
-        return True
-
-    if opcode(exp) == "mask_shl":
-        return ge_zero(exp[4])
-
-    if opcode(exp) in ["cd", "storage", "msize"]:
-        return True
-
-    if opcode(exp) in ["add", "or"]:
-        return add_ge_zero(exp)
-
-    if opcode(exp) in ("var", "ext_call.return_data"):
-        return True
-
+    if hi < 0:
+        return False
     raise CannotCompare
 
 
 @cached
-def lt_op(left, right):  # left < right
+def lt_op(left, right, top=WORD_TOP):  # left < right
+    """True if left < right, False if not, CannotCompare if it depends (see ge_zero)."""
     if type(left) == int and type(right) == int:
         return left < right
 
@@ -548,71 +968,43 @@ def lt_op(left, right):  # left < right
         terms = m.max[1:]
         right = ("max",) + tuple(add_op(t, m.num) for t in terms)
 
-    if opcode(right) == "max":
-        left, right = right, left
-
     if opcode(left) == "max":
-        results = [lt_op(l, right) for l in left[1:]]
-
+        # below the largest: below all of them
+        results = [safe_lt_op(t, right, top) for t in left[1:]]
         if all(r is True for r in results):
             return True
 
         if any(r is False for r in results):
             return False
-
-        return None
-
-    if (
-        (ml := match(left, ("add", Any, ("var", ":num"))))
-        and (mr := match(right, ("add", Any, ("var", ":num"))))
-        and ml.num != mr.num
-    ):
         raise CannotCompare
 
-    sleft = str(left)
-    sright = str(right)
-
-    if opcode(left) == "var" and str(left) not in sright:
-        raise CannotCompare
-
-    if opcode(right) == "var" and str(right) not in sleft:
-        raise CannotCompare
-
-    if type(right) == int and (m := match(left, ("add", ":int:num", ("var", Any)))):
-        if right >= m.num:
-            return False
-        else:
-            raise CannotCompare
-
-    if type(left) == int and (m := match(right, ("add", ":int:num", ("var", Any)))):
-        if left < m.num:
+    if opcode(right) == "max":
+        # below the largest: below one of them
+        results = [safe_lt_op(left, t, top) for t in right[1:]]
+        if any(r is True for r in results):
             return True
-        else:
-            raise CannotCompare
-
-    return lt2(left, right)
-
-
-def lt2(left, right):
-    subbed = sub_op(right, left)
-
-    sgn = get_sign(subbed)
-    if sgn is None:
+        if all(r is False for r in results):
+            return False
         raise CannotCompare
 
-    return sgn > 0
+    lo, hi = value_range(sub_op(right, left), top=top)
+    if lo > 0:
+        return True
+    if hi <= 0:
+        return False
+    raise CannotCompare
 
 
-def safe_lt_op(left, right):
+def safe_lt_op(left, right, top=WORD_TOP):
     try:
-        return lt_op(left, right)
+        return lt_op(left, right, top)
     except CannotCompare:
         return None
 
 
-def safe_le_op(left, right):
+def safe_le_op(left, right, top=WORD_TOP):
     try:
-        return le_op(left, right)
+        return le_op(left, right, top)
     except CannotCompare:
         return None
 
@@ -632,10 +1024,8 @@ def simplify_max(exp):
 
 
 @cached
-def le_op(left, right):  # left <= right
-    #    right = add_op(1, right)
-    #    return lt_op(left, right)
-
+def le_op(left, right, top=WORD_TOP):  # left <= right
+    """True if left <= right, False if not, CannotCompare if it depends (see ge_zero)."""
     if opcode(left) == "max":
         left = max_to_add(left)
 
@@ -645,27 +1035,25 @@ def le_op(left, right):  # left <= right
     if type(left) in (int, float) and type(right) in (int, float):
         return left <= right
 
-    subbed = sub_op(right, left)
-
-    return ge_zero(subbed)
+    return ge_zero(sub_op(right, left), top)
 
 
-def max_op(left, right):
+def max_op(left, right, top=WORD_TOP):
     try:
-        if le_op(left, right):
+        if le_op(left, right, top):
             return right
         else:
             return left
     except CannotCompare:
-        if le_op(right, left):
+        if le_op(right, left, top):
             return left
         else:
             return right
 
 
-def safe_max_op(left, right):
+def safe_max_op(left, right, top=WORD_TOP):
     try:
-        return max_op(left, right)
+        return max_op(left, right, top)
     except CannotCompare:
         return None
 
@@ -693,7 +1081,9 @@ def _max_op(base, what):
 
     res.append(what)
 
-    res = tuple(set(res))
+    # dedupe, keeping the order (a set would order the terms by their
+    # hashes, i.e. differently from one run to the next)
+    res = tuple(dict.fromkeys(res))
     if len(res) > 1:
         return ("max",) + res
     return res[0]
@@ -714,8 +1104,8 @@ def div_op(a, b):
             a = mul_op(-1, a)
             b = -b
 
-        if to_exp2(b):
-            return mask_op(a, size=256 - to_exp2(b), shr=to_exp2(b))
+        if shift := to_exp2(b):
+            return mask_op(a, size=256 - shift, offset=shift, shr=shift)
 
     if type(a) != int or type(b) != int:
         #        return None
@@ -725,21 +1115,21 @@ def div_op(a, b):
         return a // b
 
 
-def safe_min_op(left, right):
+def safe_min_op(left, right, top=WORD_TOP):
     try:
-        return min_op(left, right)
+        return min_op(left, right, top)
     except CannotCompare:
         return None
 
 
-def min_op(left, right):
+def min_op(left, right, top=WORD_TOP):
     try:
-        if le_op(left, right):
+        if le_op(left, right, top):
             return left
         else:
             return right
     except CannotCompare:
-        if le_op(right, left):
+        if le_op(right, left, top):
             return right
         else:
             return left
@@ -889,9 +1279,76 @@ def strategy_final(size, offset, shl, exp_size, exp_offset, exp_shl, exp):
     )
 
 
+def proven_le(left, right):
+    """left <= right for any value of what they're made of (see value_range)"""
+    return value_range(sub_op(right, left))[0] >= 0
+
+
+def _proven_pick(cands, first):
+    """the one of cands that first(one, other) proves to be first, else None"""
+    for c in cands:
+        if all(c == o or first(c, o) for o in cands):
+            return c
+    return None
+
+
+def strategy_proven(size, offset, shl, exp_size, exp_offset, exp_shl, exp):
+    """
+    A mask of a mask, as strategy_1 does it, but only as far as it's proven
+    (see value_range), and when what it makes can be printed as it is (see
+    readable_mask): else it stays a mask of a mask.
+    """
+    # where the bits of the inner mask end up (the ones of its word), and
+    # the bits the outer one keeps
+    inner_right = add_op(exp_offset, exp_shl)
+    inner_left = add_op(exp_offset, exp_size, exp_shl)
+    outer_right = offset
+    outer_left = add_op(offset, size)
+
+    if (
+        proven_le(inner_left, inner_right)
+        or proven_le(inner_left, outer_right)
+        or proven_le(outer_left, inner_right)
+        or proven_le(inner_left, 0)
+        or proven_le(256, inner_right)
+    ):
+        return 0
+
+    left = _proven_pick((outer_left, inner_left, 256), proven_le)
+    right = _proven_pick((outer_right, inner_right, 0), lambda a, b: proven_le(b, a))
+    final = strategy_final(size, offset, shl, exp_size, exp_offset, exp_shl, exp)
+    if left is None or right is None:
+        return final
+
+    new_size = sub_op(left, right)
+    new_offset = sub_op(right, exp_shl)
+    if proven_le(new_size, 0):
+        return 0
+    if not is_word(new_size):
+        return final
+    if not all_concrete(new_size, new_offset) and all_concrete(
+        size, offset, exp_size, exp_offset
+    ):
+        # a size or an offset made of a shift (uint8(x << n), 2 * (1 << n)):
+        # the two masks read better
+        return final
+
+    res = mask_op(exp, size=new_size, offset=new_offset, shl=add_op(shl, exp_shl))
+    if opcode(res) == "mask_shl" and not readable_mask(*res[1:4]):
+        return final
+    return res
+
+
 def mask_mask_op(size, offset, shl, exp_size, exp_offset, exp_shl, exp):
     if all_concrete(offset, shl, exp_offset, exp_shl, exp_size, size):
         return strategy_concrete(size, offset, shl, exp_size, exp_offset, exp_shl, exp)
+
+    if readable_mask(size, offset, shl) and readable_mask(
+        exp_size, exp_offset, exp_shl
+    ):
+        # (a mask whose shift isn't known to be a left or a right one would
+        # be read as neither)
+        return strategy_proven(size, offset, shl, exp_size, exp_offset, exp_shl, exp)
 
     strategies = (strategy_0, strategy_1, strategy_2, strategy_3, strategy_final)
 
@@ -903,7 +1360,13 @@ def mask_mask_op(size, offset, shl, exp_size, exp_offset, exp_shl, exp):
     assert False
 
 
+# (what a mask makes of an expression may rest on what's known of the
+# variables in it, see value_range: forgotten with the rest)
 mask_dict = {}
+CACHES.append(mask_dict)
+
+# the operations whose result is 0 or 1
+BOOL_OPS = ("bool", "iszero", "lt", "gt", "le", "ge", "eq", "slt", "sgt", "sle", "sge")
 
 
 def mask_op(exp, size=256, offset=0, shl=0, shr=0):
@@ -920,7 +1383,7 @@ def mask_op(exp, size=256, offset=0, shl=0, shr=0):
 
 
 def _mask_op(exp, size=256, offset=0, shl=0, shr=0):
-    if size == 0:
+    if size == 0 or exp == 0:
         return 0
     #    if (size, offset, shl, shr) == (256, 0, 0, 0):
     #        return exp
@@ -930,6 +1393,23 @@ def _mask_op(exp, size=256, offset=0, shl=0, shr=0):
 
     shl = sub_op(shl, shr)
     shr = 0
+
+    if opcode(exp) in BOOL_OPS and all_concrete(size, offset, shl):
+        # 0 or 1: a mask keeps it as it is, or drops it
+        if offset > 0 or size <= 0:
+            return 0
+        if shl == 0:
+            return exp
+
+    if (
+        m := match(exp, ("storage", ":stor_size", ":int:stor_offset", ":stor_idx"))
+    ) and m.stor_offset < 0:
+        # a field moved left (see apply_mask_to_storage): a mask of the field,
+        # moved
+        field = ("storage", m.stor_size, 0, m.stor_idx)
+        return mask_op(
+            ("mask_shl", m.stor_size, 0, -m.stor_offset, field), size, offset, shl
+        )
 
     if m := match(exp, ("storage", ":stor_size", ":stor_offset", ":stor_idx")):
         # trimming the storage inside
@@ -951,15 +1431,25 @@ def _mask_op(exp, size=256, offset=0, shl=0, shr=0):
             and shl >= 8
             and size == 256
             and (new_exp := apply_mask_to_storage(exp, size - shl, offset, shl))
+            is not None
         ):
             return new_exp
 
-        elif new_exp := apply_mask_to_storage(exp, size, offset, shl):
+        elif (new_exp := apply_mask_to_storage(exp, size, offset, shl)) is not None:
+            # (0 when the mask is above the bits read: Mask(56, 200, uint200(x)))
             return new_exp
 
     if opcode(exp) == "or":
         rest = exp[1:]
         return or_op(*[mask_op(e, size, offset, shl, shr) for e in rest])
+
+    if (
+        (m := match(exp, ("signextend", ":int:b", ":val")))
+        and all_concrete(size, offset)
+        and offset + size <= 8 * (m.b + 1)
+    ):
+        # bits that signextend doesn't change
+        return mask_op(m.val, size, offset, shl)
 
     if opcode(exp) == "mask_shl":
         params = exp[1:]
@@ -986,30 +1476,56 @@ def apply_mask_to_storage(exp, size, offset, shl):
     shl = add_op(shl, offset)
     offset = 0
 
-    if safe_lt_op(size, stor_size):
+    if safe_le_op(size, stor_size) is True:
         stor_size = size
+    elif safe_le_op(stor_size, size) is not True:
+        # which one is narrower isn't known (e.g. uint8 of a field of
+        # 256 - 8 * i bits): the mask has to stay
+        return None
 
     if safe_le_op(stor_size, 0) is True:
         return 0
 
     res = ("storage", stor_size, stor_offset, stor_idx)
 
-    shr = 0
-
     if shl == 0:
         return res
-    else:
-        if (m := match(res, ("storage", size, 0, ":stor_idx"))) and offset == 0:
-            stor_idx = m.stor_idx
-            shr = minus_op(shl)
-            return ("storage", size, shr, stor_idx)
+
+    if type(shl) is not int:
+        # (a field moved left, below, is by a number of bits known)
+        return None
+
+    if shl < 0:
+        # moved right: its bits from -shl on, at 0
+        new_size = add_op(stor_size, shl)
+        if type(new_size) is not int:
+            return None
+        if new_size <= 0:
+            return 0
+        return ("storage", new_size, add_op(stor_offset, -shl), stor_idx)
+
+    if (m := match(res, ("storage", size, 0, ":stor_idx"))) and offset == 0:
+        # a field moved left (see _mask_op)
+        return ("storage", size, -shl, m.stor_idx)
 
 
 def apply_mask(val, size, offset=0, shl=0):
     assert all_concrete(val, size, offset, shl)
 
+    # a word (-1 is 2**256 - 1, see simplify_exp) is its 256 bits, and what
+    # the mask makes of it a word: the bits moved past its top are gone - x
+    # << 128 of shl_op is all of x moved. (A number of more bytes, of a long
+    # memory range, is as wide as it is.)
+    word = -(2**256) < val < 2**256
+    if word:
+        val %= 2**256
+
     mask = mask_to_int(size, offset)
     val = val & mask
+
+    if shl >= 256 or shl <= -256:
+        # shifted out of the word entirely
+        return 0
 
     if shl > 0:
         val = val << shl
@@ -1017,7 +1533,109 @@ def apply_mask(val, size, offset=0, shl=0):
     if shl < 0:
         val = val >> -shl
 
-    return val
+    return val % 2**256 if word else val
+
+
+def shr_op(exp, off):
+    """
+    exp >> off: the bits [off, 256) of exp, moved down by off, the same mask
+    as a division by 2**off (see Stack.simplify).
+
+    A shift by a symbolic amount is left as ("shr", off, exp): its mask would
+    have a symbolic size too, Mask(256 - off, off, exp) >> off, which reads
+    worse and doesn't simplify any better. simplify_exp turns it into the mask
+    once the amount is known.
+    """
+    if not isinstance(off, int):
+        return ("shr", off, exp)
+
+    if off >= 256:
+        return 0
+
+    return mask_op(exp, size=256 - off, offset=off, shr=off)
+
+
+def shl_op(exp, off):
+    """
+    exp << off, off a word: a mask of exp moved left by off - when that's
+    what it is, off being the integer it's made of (see value_range: a word
+    such as 159 - x isn't) and the mask one that can be printed as it is
+    (see readable_mask). Else it's left as it is, ("shl", off, exp).
+    """
+    if exp == 0:
+        # (moved by anything)
+        return 0
+
+    if type(off) is int:
+        return 0 if off >= 256 else mask_op(exp, shl=off)
+
+    if is_word(off) and value_range(off)[1] < 256:
+        # (one that may be 256 or more shifts it all out, but known it may
+        # be a word written negative, -8: a mask would move it right)
+        res = mask_op(exp, shl=off)
+        if _readable(res):
+            return res
+
+    return ("shl", off, exp)
+
+
+def _readable(exp):
+    """whether a mask made by mask_op can be printed as it is"""
+    if type(exp) is int:
+        return True
+    if m := match(exp, ("mask_shl", ":size", ":off", ":shl", Any)):
+        return readable_mask(m.size, m.off, m.shl)
+    if opcode(exp) == "or":
+        return all(_readable(e) for e in exp[1:])
+    if m := match(exp, ("storage", ":size", ":off", Any)):
+        return type(m.size) is int and type(m.off) is int
+    return False
+
+
+def signextend_op(b, val):
+    """
+    ("signextend", b, val): the lowest 8 * (b + 1) bits of val as a signed
+    number, the bits above them copies of the highest of them.
+    """
+    if type(b) is not int:
+        return ("signextend", b, val)
+
+    # (the word of what it was made of)
+    b %= 2**256
+    bits = 8 * (b + 1)
+    if bits >= 256:
+        return val
+
+    if type(val) is int:
+        low = val & (2**bits - 1)
+        if low >> (bits - 1):
+            return low | (2**256 - 2**bits)
+        return low
+
+    if m := match(val, ("signextend", ":int:c", ":inner")):
+        return signextend_op(min(b, m.c), m.inner)
+
+    # a number made of some bits of another one: only its lowest bits count,
+    # and if it has less than them the highest one is 0
+    if (
+        (m := match(val, ("mask_shl", ":int:size", ":int:off", ":int:shl", ":inner")))
+        and m.shl == -m.off
+        and m.off >= 0
+    ):
+        if m.size < bits:
+            return val
+        if m.off == 0:
+            return signextend_op(b, m.inner)
+        if m.size > bits:
+            return ("signextend", b, ("mask_shl", bits, m.off, -m.off, m.inner))
+
+    if (m := match(val, ("storage", ":int:size", ":int:off", ":loc"))) and m.off >= 0:
+        if m.size < bits:
+            return val
+        if m.size > bits:
+            return ("signextend", b, ("storage", bits, m.off, m.loc))
+
+    return ("signextend", b, val)
 
 
 def try_add(self, other):
@@ -1028,31 +1646,26 @@ def try_add(self, other):
 
 
 def __try_add(self, other):
+    return _try_add(_unshift(self), _unshift(other))
+
+
+def _unshift(term):
+    """
+    num * Mask(size, off, shl, val) is num * 2**shl * Mask(size, off, 0, val),
+    and when no bit of the mask stays under 256 - shl, the mask can take all
+    the bits from off: e.g. 8 * x is Mask(253, 0, 3, x), which becomes
+    8 * Mask(256, 0, 0, x), and adds up with x.
+    """
     if (
         m := match(
-            self,
+            term,
             ("mul", ":num", ("mask_shl", ":int:size", ":int:off", ":int:shl", ":val")),
         )
     ) and m.shl > 0:
-        self = (
-            "mul",
-            m.num + 2**m.shl,
-            ("mask_shl", m.size + m.shl, m.off, 0, m.val),
-        )
+        size = m.size + m.shl if m.off + m.size + m.shl >= 256 else m.size
+        return ("mul", m.num * _pow2(m.shl), ("mask_shl", size, m.off, 0, m.val))
 
-    if (
-        m := match(
-            other,
-            ("mul", ":num", ("mask_shl", ":int:size", ":int:off", ":int:shl", ":val")),
-        )
-    ) and m.shl > 0:
-        other = (
-            "mul",
-            m.num + 2**m.shl,
-            ("mask_shl", m.size + m.shl, m.off, 0, m.val),
-        )
-
-    return _try_add(self, other)
+    return term
 
 
 def _try_add(self, other):
@@ -1074,8 +1687,8 @@ def _try_add(self, other):
         )
         and mo.other_size == 256 - mo.shl
     ):
-        mo.mul *= 2**mo.shl - 1
-        return mul_op(mo.mul, ms.val)
+        # mul * 2**shl * val - val
+        return mul_op(mo.mul * _pow2(mo.shl) - 1, ms.val)
 
     #    if self, other == mul(x, exp), mul(y, exp)
     #                   => mul(x+y, exp)
@@ -1152,12 +1765,6 @@ def _try_add(self, other):
             m = ("mask_shl", 256 - y, y, 0, x)  # - x #== 2**y-1 - Mask(y,0,0, x)
             if self[2] == m:
                 return mul_op(other[1], mask_op(x, size=y))
-            m = ("mask_shl", 251 - y, y, 0, x)  # close enough ;)
-            # happens in memcopy loops, shouldn't cause significant bugs
-            # and helps clean up the code a lot
-
-            if self[2] == m:
-                return mul_op(other[1], mask_op(x, size=y))
 
     # other
 
@@ -1186,7 +1793,8 @@ def _try_add(self, other):
         and (mo := match(exp2, ("mask_shl", ":int:size2", 0, 0, ms.x)))
         and mo.size2 < ms.size1
     ):
-        return ("mul", num1, ("mask_shl", ms.size1 - mo.size2, 0, 0, ms.x))
+        # the bits [size2, size1) of x
+        return ("mul", num1, ("mask_shl", ms.size1 - mo.size2, mo.size2, 0, ms.x))
 
     return None
 
@@ -1200,4 +1808,9 @@ assert add_op(64, ("var", 4)) == ("add", 64, ("var", 4))
 
 l = ("add", 128, ("cd", ("add", 4, ("cd", 36))))
 r = ("add", 128, ("mask_shl", 251, 5, 0, ("add", 31, ("cd", ("add", 4, ("cd", 36))))))
-assert le_op(l, r) == True, le_op(r, l)
+# (a length below 2**64, as a memory size is: then ceil32 doesn't wrap)
+set_variables({}, {("cd", ("add", 4, ("cd", 36)))})
+assert le_op(l, r, MEMORY_TOP) is True
+set_variables({})
+assert safe_le_op(l, r, MEMORY_TOP) is None
+assert safe_le_op(l, r) is None

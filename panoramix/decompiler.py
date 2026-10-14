@@ -4,20 +4,68 @@ import json
 import logging
 import os
 import sys
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 
 import timeout_decorator
 
 import panoramix.folder as folder
 from panoramix.contract import Contract
-from panoramix.function import Function
+from panoramix.function import Function, InternalFunction
 from panoramix.loader import Loader
-from panoramix.prettify import explain, pprint_repr, pprint_trace, pretty_type
-from panoramix.vm import VM
+from panoramix.prettify import explain, pprint_repr, pprint_trace
+from panoramix.safemath import pretty_defs
+from panoramix.storage import pretty_def
+from panoramix.vm import RETURN_ADDRESS, VM, entry_memory
 from panoramix.whiles import make_whiles
-from panoramix.utils.helpers import C, rewrite_trace
+from panoramix.utils.helpers import C, internal_name, rewrite_trace
 
 logger = logging.getLogger(__name__)
+
+# The time given to each step of a function (the execution, the
+# simplification) and to a function as a whole, in seconds. PANORAMIX_TIMEOUT
+# scales them (e.g. 10 for a slow machine, or to compare outputs).
+_scale = float(os.environ.get("PANORAMIX_TIMEOUT", "1"))
+STEP_TIMEOUT = 60 * _scale
+FUNCTION_TIMEOUT = 60 * 3 * _scale
+
+# The ifs of a trace nest as deep as the jumps of the code take them, and
+# the walks of a trace (the simplifier's, the folder's, the printer's)
+# recurse into them: python's 1000 frames failed a function past some 300
+# levels (a RecursionError, the function lost).
+RECURSION_LIMIT = 100_000
+FRAME_SIZE = 2048  # bytes of the stack a frame takes, at most (pypy's: ~750)
+
+
+@contextmanager
+def deep_recursion():
+    """
+    Python's recursion as deep as RECURSION_LIMIT frames, the main thread's
+    stack let grow for them - or as deep as the stack holds, where the
+    system doesn't let it grow.
+    """
+    limit = sys.getrecursionlimit()
+    stack = None
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+        size = RECURSION_LIMIT * FRAME_SIZE
+        if soft != resource.RLIM_INFINITY and soft < size:
+            if hard != resource.RLIM_INFINITY:
+                size = min(size, hard)
+            if size > soft:
+                resource.setrlimit(resource.RLIMIT_STACK, (size, hard))
+                stack = (soft, hard)
+        sys.setrecursionlimit(max(limit, size // FRAME_SIZE))
+    except (ImportError, ValueError, OSError):
+        pass
+
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(limit)
+        if stack is not None:
+            resource.setrlimit(resource.RLIMIT_STACK, stack)
 
 
 @dataclasses.dataclass
@@ -42,13 +90,33 @@ class TimeoutInterrupt(BaseException):
 def decompile_bytecode(code: str, only_func_name=None) -> Decompilation:
     loader = Loader()
     loader.load_binary(code)  # Code is actually hex.
-    return _decompile_with_loader(loader, only_func_name)
+    with deep_recursion():
+        return _decompile_with_loader(loader, only_func_name)
 
 
 def decompile_address(address: str, only_func_name=None) -> Decompilation:
     loader = Loader()
     loader.load_addr(address)
-    return _decompile_with_loader(loader, only_func_name)
+    with deep_recursion():
+        return _decompile_with_loader(loader, only_func_name)
+
+
+def clean_up(trace):
+    """The trace of a function's VM, its loops whiles (see make_whiles)."""
+    explain("Initial decompiled trace", trace)
+
+    if "--explain" in sys.argv:
+        trace = rewrite_trace(trace, lambda line: [] if type(line) == str else [line])
+        explain("Without assembly", trace)
+
+    logger.info(" -> Cleaning up AST, identifying loops...")
+    trace = make_whiles(trace, timeout=STEP_TIMEOUT)
+    explain("final", trace)
+
+    if "--explain" in sys.argv:
+        explain("folded", folder.fold(trace))
+
+    return trace
 
 
 def _decompile_with_loader(loader, only_func_name=None) -> Decompilation:
@@ -134,6 +202,9 @@ def _decompile_with_loader(loader, only_func_name=None) -> Decompilation:
 
     problems = {}
     functions = {}
+    # the recursive internal functions the VMs found (see vm.VM.internal):
+    # entry -> (n, m, frame), as found first
+    internal = {}
 
     for hash, fname, target, stack in loader.func_list:
         """
@@ -151,35 +222,90 @@ def _decompile_with_loader(loader, only_func_name=None) -> Decompilation:
         logger.debug("stack %s", stack)
 
         try:
-            if target > 1 and loader.lines[target][1] == "jumpdest":
+            if loader.lines.get(target, (None, None))[1] == "jumpdest" and target > 1:
                 target += 1
 
-            @timeout_decorator.timeout(60 * 3, timeout_exception=TimeoutInterrupt)
+            @timeout_decorator.timeout(
+                FUNCTION_TIMEOUT, timeout_exception=TimeoutInterrupt
+            )
             def dec():
                 logger.info(" -> Interpreting EVM on function...")
-                trace = VM(loader).run(target, stack=stack, timeout=60)
-                explain("Initial decompiled trace", trace[1:])
+                # (the default function where it's all of the dispatcher, not
+                # where it starts: what's known there is what its entries,
+                # each of the paths to it, have in common - see loader.entry)
+                if hash == "_fallback" and target == 0:
+                    known = loader.fallback_known
+                else:
+                    known = ()
+                vm = VM(loader)
+                trace = vm.run(
+                    target,
+                    stack=stack,
+                    timeout=STEP_TIMEOUT,
+                    known=known,
+                    entry=loader.entry(hash),
+                    memory=entry_memory(loader.entries.get(hash)),
+                )
+                found.update(vm.found)
+                return clean_up(trace)
 
-                if "--explain" in sys.argv:
-                    trace = rewrite_trace(
-                        trace, lambda line: [] if type(line) == str else [line]
-                    )
-                    explain("Without assembly", trace)
-
-                logger.info(" -> Cleaning up AST, identifying loops...")
-                trace = make_whiles(trace, timeout=60)
-                explain("final", trace)
-
-                if "--explain" in sys.argv:
-                    explain("folded", folder.fold(trace))
-
-                return trace
-
+            found = {}
             trace = dec()
             functions[hash] = Function(hash, trace)
+            for entry, rec in found.items():
+                internal.setdefault(entry, rec)
         except (Exception, TimeoutInterrupt):
             problems[hash] = fname
             logger.exception("Problem with %s%s", fname, C.end)
+
+    """
+        The recursive internal functions, decompiled apart: those the functions
+        call, then those they call - in the order of the code.
+    """
+
+    internal_functions = {}
+    todo = sorted(internal)
+
+    while todo:
+        new = []
+
+        for entry in todo:
+            n, m, frame = internal[entry]
+            name = internal_name(entry)
+            logger.info("Decompiling %s...", name)
+
+            try:
+
+                @timeout_decorator.timeout(
+                    FUNCTION_TIMEOUT, timeout_exception=TimeoutInterrupt
+                )
+                def dec_internal():
+                    logger.info(" -> Interpreting EVM on function...")
+                    vm = VM(loader, internal={entry: (n, m, frame)})
+                    # its params where its calls push them, above the
+                    # address it returns to
+                    trace = vm.run(
+                        entry,
+                        stack=(RETURN_ADDRESS,)
+                        + tuple(("param", f"_param{i + 1}") for i in range(n)),
+                        timeout=STEP_TIMEOUT,
+                        inside=True,
+                    )
+                    found.update(vm.found)
+                    return clean_up(trace)
+
+                found = {}
+                trace = dec_internal()
+                internal_functions[entry] = InternalFunction(entry, n, m, frame, trace)
+                for e, rec in found.items():
+                    if e not in internal:
+                        internal[e] = rec
+                        new.append(e)
+            except (Exception, TimeoutInterrupt):
+                problems[name] = name
+                logger.exception("Problem with %s%s", name, C.end)
+
+        todo = sorted(new)
 
     logger.info("Functions decompilation finished, now doing post-processing.")
 
@@ -192,6 +318,8 @@ def _decompile_with_loader(loader, only_func_name=None) -> Decompilation:
     contract = Contract(
         problems=problems,
         functions=functions,
+        code=bytes(loader.binary or []),
+        internal=[internal_functions[e] for e in sorted(internal_functions)],
     )
 
     contract.postprocess()
@@ -242,11 +370,18 @@ def _decompile_with_loader(loader, only_func_name=None) -> Decompilation:
             print()
 
         if len(contract.stor_defs) > 0:
-            print(f"{C.green}def {C.end}storage:")
+            lang = " (vyper)" if contract.lang == "vyper" else ""
+            print(f"{C.green}def {C.end}storage{lang}:")
 
             for s in contract.stor_defs:
-                print(pretty_type(s))
+                print(pretty_def(s))
 
+            print()
+
+        if contract.safemath:
+            print(f"{C.green}def {C.end}SafeMath:")
+            for line in pretty_defs(contract.safemath):
+                print(line)
             print()
 
         """
@@ -288,6 +423,21 @@ def _decompile_with_loader(loader, only_func_name=None) -> Decompilation:
                 if "--returns" in sys.argv:
                     for r in func.returns:
                         print(r)
+
+                if "--repr" in sys.argv:
+                    pprint_repr(func.orig_trace)
+
+                print()
+
+        """
+            Print out the recursive internal functions
+        """
+
+        if contract.internal:
+            print(C.gray + "#\n#  Internal functions\n#" + C.end + "\n")
+
+            for func in contract.internal:
+                print(func.print())
 
                 if "--repr" in sys.argv:
                     pprint_repr(func.orig_trace)

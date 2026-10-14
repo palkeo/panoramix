@@ -5,7 +5,7 @@ import panoramix.core.arithmetic as arithmetic
 from panoramix.core.algebra import mask_op, neg_mask_op
 from panoramix.core.masks import to_mask, to_neg_mask
 from panoramix.prettify import prettify
-from panoramix.utils.helpers import EasyCopy, opcode, to_exp2
+from panoramix.utils.helpers import CACHES, EasyCopy, opcode, to_exp2
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,9 @@ def fold_stacks(self, latter, depth):
     of the loop, and from the end of the loop, and tries to figure out the loop variables.
 
     It then returns a stack that has variables in it instead of values.
+
+    `depth`: what tells the loop from the others (see VM.loop_key), the
+    variables are numbered after.
 
     """
     assert len(self) == len(latter), (self, latter)
@@ -43,12 +46,30 @@ def fold_stacks(self, latter, depth):
     return first, vars
 
 
+def stack_vars(first, positions, depth):
+    """
+    Like fold_stacks, with the positions of the loop variables given: the stack
+    from the beginning of the loop with variables in those positions, and the
+    variables.
+    """
+    first = list(first)
+    vars = []
+
+    for idx in sorted(positions, reverse=True):
+        temp_var_counter = len(first) - idx + depth * 1000
+
+        vars.append(("var", temp_var_counter, first[idx], idx))
+        first[idx] = ("var", temp_var_counter)
+
+    return first, vars
+
+
 class Stack(EasyCopy):
     def __init__(self, val=None):
-        if type(val) == tuple:
-            val = list(val)
-
-        self.stack = val or []
+        # a copy: the VM works on the stack in place, and the node it's
+        # taken from keeps the one it starts with (loops are found by
+        # comparing those)
+        self.stack = list(val) if val else []
 
     def __str__(self):
         return (
@@ -115,16 +136,16 @@ class Stack(EasyCopy):
         res = []
 
         for el in self.stack:
-            if (
-                type(el) == int
-                and el in jump_dests
-                or (type(el) == int and el > 2000 and el < 5000)
-            ):
+            # (the places the code may jump back to: not any number - one
+            # between 2000 and 5000 made a loop over a memory pointer there
+            # unrolled until the pointer got past 5000)
+            if type(el) == int and el in jump_dests:
                 res.append(str(el))
 
         return res
 
     simplify_cache = {}
+    CACHES.append(simplify_cache)
 
     @staticmethod
     def simplify(exp):
@@ -148,6 +169,9 @@ class Stack(EasyCopy):
 
         if op in arithmetic.OPCODES:
             exp = arithmetic.eval(exp)
+
+            if type(exp) != tuple:
+                return exp
 
         if op in ("and", "div", "mul"):
             left = exp[1]

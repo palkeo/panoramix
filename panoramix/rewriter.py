@@ -6,7 +6,6 @@ from time import gmtime, strftime
 import panoramix.core.arithmetic as arithmetic
 from panoramix.core.algebra import (
     _max_op,
-    add_ge_zero,
     add_op,
     apply_mask,
     apply_mask_to_storage,
@@ -41,6 +40,7 @@ from panoramix.core.arithmetic import is_zero, to_real_int
 from panoramix.core.masks import get_bit, to_mask, to_neg_mask
 from panoramix.core.memloc import (
     apply_mask_to_range,
+    low_zero_bits,
     memloc_overwrite,
     range_overlaps,
     sizeof,
@@ -77,67 +77,84 @@ from panoramix.utils.helpers import (
 
 
 def postprocess_exp(exp):
-    if opcode(exp) == "data":
-        terms = exp[1:]
-        # make arrays in data
-        concrete = [t for t in terms if type(t) == int and t % 32 == 0]
-        if len(concrete) == 1:
-            # potential array in data?
-            assert concrete[0] % 32 == 0
-            loc = concrete[0] // 32
-            if loc + 1 < len(terms) and loc > terms.index(concrete[0]):
-                arr = ("arr",) + terms[loc:]
+    """
+    An array in a list of data - its offset, then after the other words its
+    length and content - as Array(len=..., data=...), that is ABI-encoded:
+    its content padded with zeroes to whole words (see OUTPUT.md). Where the
+    data has that padding only: its content is whole words, or is as many
+    bytes as its length followed by the zeroes up to them. DSNote's log of
+    msg.data, `log ... call.value, 64, calldata.size, call.data[0 len
+    calldata.size]`, has none.
+    """
+    if opcode(exp) != "data":
+        return exp
 
-                # heuristics for cleaning up various misprocessed stuff
+    terms = exp[1:]
+    concrete = [t for t in terms if type(t) == int and t % 32 == 0]
+    if len(concrete) != 1:
+        return exp
 
-                if (
-                    m := match(arr, ("arr", ":l", (":op", Any, ":l"), ...))
-                ) and is_array(m.op):
-                    arr = arr[:3]
-
-                elif (
-                    m := match(
-                        arr,
-                        (
-                            "arr",
-                            ":l",
-                            (
-                                "mask_shl",
-                                ("mask_shl", 253, 0, 3, ":l"),
-                                Any,
-                                Any,
-                                ("data", (":op", ":st", ":l"), ...),
-                                ...,
-                            ),
-                        ),
-                    )
-                ) and is_array(m.op):
-                    arr = ("arr", m.l, (m.op, m.st, m.l))
-
-                t2 = tuple([arr if t == loc * 32 else t for t in terms[:loc]])
-                return ("data",) + t2
-
-    # this would really require debugging as to why such thing happens, and a nicer cleanup.
-    # but it's last minute fixes again :)
-
-    if m := match(
-        exp,
-        (
-            "arr",
-            ":l",
-            (
-                "mask_shl",
-                ("mask_shl", Any, 0, 3, ":l"),
-                ("add", 256, Any),
-                ("add", -256, Any),
-                ("data", ("call.data", ":s", ":l"), ...),
-                ...,
-            ),
-        ),
+    loc = concrete[0] // 32
+    if not (
+        loc + 1 < len(terms)
+        and loc > terms.index(concrete[0])
+        # the offset is one of words up to the length
+        and all(sizeof(t) == 256 for t in terms[: loc + 1])
     ):
-        return ("arr", m.l, ("call.data", m.s, m.l))
+        return exp
 
-    return exp
+    content = abi_content(terms[loc], terms[loc + 1 :])
+    if content is None:
+        return exp
+
+    arr = ("arr", terms[loc]) + content
+    t2 = tuple([arr if t == loc * 32 else t for t in terms[:loc]])
+    return ("data",) + t2
+
+
+def abi_content(length, content):
+    """
+    What an Array(len=length, data=...) of the bytes of content is printed
+    with - as they are if they're whole words (padding them adds nothing),
+    without the zeroes after its `length` bytes up to whole words - None if
+    they're neither.
+    """
+    content = tuple(content)
+    size = byte_size(content)
+
+    data = content
+    while data and (data[-1] == 0 or match(data[-1], ("bytes", Any, 0))):
+        data = data[:-1]
+    words = ("mask_shl", 251, 5, 0, add_op(31, length))
+    if (
+        size is not None
+        and sub_op(byte_size(data), length) == 0
+        and sub_op(size, words) == 0
+    ):
+        return data
+
+    if size is not None and low_zero_bits(size) >= 5:
+        return content
+
+    return None
+
+
+def byte_size(terms):
+    """how many bytes the elements of a data are, None if that's not known"""
+    res = 0
+    for t in terms:
+        if m := match(t, ("bytes", ":n", Any)):
+            n = m.n
+        elif (m := match(t, (":op", Any, ":n"))) and is_array(m.op):
+            n = m.n
+        elif m := match(t, ("mem", ("range", Any, ":n"))):
+            n = m.n
+        elif type(w := sizeof(t)) is int and w % 8 == 0:
+            n = w // 8
+        else:
+            return None
+        res = add_op(res, n)
+    return res
 
 
 def postprocess_trace(line):
@@ -171,7 +188,7 @@ def postprocess_trace(line):
                 return [exp]
 
         true_arr = find_f_list(if_true, find_arr_l)
-        false_arr = find_f_list(if_true, find_arr_l)
+        false_arr = find_f_list(if_false, find_arr_l)
 
         if len(true_arr) > 0 and len(true_arr) == len(false_arr):
             return if_true
@@ -186,7 +203,7 @@ def postprocess_trace(line):
                 return [exp]
 
         true_arr = find_f_list(if_true, find_arr_l)
-        false_arr = find_f_list(if_true, find_arr_l)
+        false_arr = find_f_list(if_false, find_arr_l)
 
         if len(true_arr) > 0 and len(true_arr) == len(false_arr):
             return if_true
@@ -198,16 +215,16 @@ def postprocess_trace(line):
         e.g. 0xf97187f566eC6374cB08470CCe593fF0Dd36d8A9, baseURI
              0xFcD0d8E3ae34922A2921f7E7065172e5317f8ad8, name
 
-        The below hides the cases for < 31, and for 0, and shows only for >31. Technically incorrect,
-        and I'm not super comfortable with this, but some of the code would be very unreadable without it.
-
-
+        When it's longer than 31 bytes, it isn't empty: the check that it is
+        can go.
     """
 
     if m := match(line, ("if", ("lt", 31, ":some_len"), ":if_true", ":if_false")):
         some_len, if_true, if_false = m.some_len, m.if_true, m.if_false
-        if len(if_true) == 2:
-            first, second = if_true[0], if_true[1]
+        if len(if_true) >= 2:
+            # the `if iszero(len)` may be followed by more code when its
+            # branches got merged (see vm.merge_branches)
+            first, second, *rest = if_true
             if (
                 opcode(first) == "store"
                 and contains(first, some_len)
@@ -218,146 +235,10 @@ def postprocess_trace(line):
                     )
                 )
             ):
-                return [first] + m.deep_false
-
-    if (
-        m := match(
-            line,
-            (
-                "if",
-                (
-                    "iszero",
-                    (
-                        "mask_shl",
-                        255,
-                        1,
-                        0,
-                        (
-                            "and",
-                            ("storage", 256, 0, ":loc"),
-                            (
-                                "add",
-                                -1,
-                                (
-                                    "mask_shl",
-                                    248,
-                                    0,
-                                    8,
-                                    ("iszero", ("storage", 1, 0, ":loc")),
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
-                ":if_true",
-                ":if_false",
-            ),
-        )
-    ) or (
-        m := match(
-            line,
-            (
-                "if",
-                (
-                    "iszero",
-                    (
-                        "mask_shl",
-                        255,
-                        1,
-                        0,
-                        (
-                            "and",
-                            (
-                                "add",
-                                -1,
-                                (
-                                    "mask_shl",
-                                    248,
-                                    0,
-                                    8,
-                                    ("iszero", ("storage", 1, 0, ":loc")),
-                                ),
-                            ),
-                            ("storage", 256, 0, ":loc"),
-                        ),
-                    ),
-                ),
-                ":if_true",
-                ":if_false",
-            ),
-        )
-    ):
-        if_true, if_false, loc = m.if_true, m.if_false, m.loc
-
-        if len(if_false) == 1:
-            first = if_false[0]
-
-            if (
-                m := match(
-                    first,
-                    (
-                        "if",
-                        ("lt", 31, ("storage", 256, 0, ("length", loc))),
-                        ":deep_true",
-                        ":deep_false",
-                    ),
-                )
-            ) or (
-                m := match(
-                    first,
-                    (
-                        "if",
-                        ("lt", 31, ("storage", 256, 0, ("length", ("loc", loc)))),
-                        ":deep_true",
-                        ":deep_false",
-                    ),
-                )
-            ):
-                return m.deep_true
+                if_true = [first] + m.deep_false + rest
+                return [("if", ("lt", 31, some_len), if_true, if_false)]
 
     return [line]
-
-
-def rewrite_string_stores(lines):
-    # ugly af, and not super-precise. it should be split into 2 parts,
-    # converting array->storage writes in loop_to_setmem_from_storage
-    # and then relying on those storage writes here for cleanup
-
-    assert len(lines) == 3
-    l1, l2, l3 = lines[0], lines[1], lines[2]
-    if (
-        (
-            m1 := match(
-                l1,
-                ("store", 256, 0, ":idx", ("add", 1, ("mask_shl", 255, 0, 1, ":src"))),
-            )
-        )
-        and (m2 := match(l2, ("while", ("gt", Any, Any), ":path2", Any, ":setvars")))
-        and match(l3, ("while", ("gt", ...), ":path3", ...))
-        and len(m2.path2) == 2
-        and (x := m2.path2[0])
-        and match(
-            x,
-            (
-                "store",
-                256,
-                0,
-                ("add", ("var", Any), Any),
-                ("mem", ("range", ("var", ":v"), 32)),
-            ),
-        )
-    ):
-        return [
-            (
-                "store",
-                256,
-                0,
-                ("array", "", ("sha3", m1.idx)),
-                ("arr", m1.src, ("mem", ("range", m2.setvars[1][2], m1.src))),
-            )
-        ]
-
-    return None
 
 
 def rewrite_memcpy(lines):  # 2

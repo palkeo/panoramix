@@ -1,0 +1,6 @@
+[virtualenvs]
+in-project = true
+
+[installer]
+no-binary = ["aiohttp", "yarl", "websockets", "bitarray", "charset-normalizer", "lru-dict", "frozenlist", "pycryptodome", "multidict", "cytoolz"]
+parallel = false

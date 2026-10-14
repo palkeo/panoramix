@@ -1,5 +1,4 @@
 import os
-import math
 import re
 import string
 import logging
@@ -107,7 +106,7 @@ def clean_color(s):
 
 
 precompiled = {
-    1: "erecover",  # msg_hash =, v = , r = , s =
+    1: "ecrecover",  # msg_hash =, v = , r = , s =
     2: "sha256hash",
     3: "ripemd160hash",
     # 4: "memcpy", -- handled separately
@@ -129,6 +128,11 @@ precompiled_var_names = {
 }
 
 
+def internal_name(entry):
+    """The name of the recursive internal function at entry (see vm.VM.internal)."""
+    return f"internal_{hex(entry)}"
+
+
 def opcode(exp):
     if type(exp) != tuple or len(exp) == 0:
         return None
@@ -136,8 +140,34 @@ def opcode(exp):
         return exp[0]
 
 
+# Expressions bigger than this (in number of atoms) get a variable in the vm,
+# that the simplifier then doesn't inline. Normal contracts stay well below.
+MAX_EXP_SIZE = 150
+
+
+def exp_size(exp):
+    if type(exp) == tuple:
+        return sum(exp_size(e) for e in exp)
+    return 1
+
+
+# the caches of the cached functions, and the other ones registered: see
+# clear_caches
+CACHES = []
+
+
+def clear_caches():
+    """
+    Forget what was computed and cached: when what it rests on changes (see
+    variants.set_free_memory_pointer).
+    """
+    for cache in CACHES:
+        cache.clear()
+
+
 def cached(func):
     cache = {}
+    CACHES.append(cache)
 
     def wrapper(*args, **kwargs):
         key = args + tuple(kwargs.items())
@@ -471,18 +501,20 @@ def to_exp2(num):  # checks if num is a power of 2, and if so, returns to which 
     if num < 1:
         return None
 
-    l = math.log2(num)
-    if l.is_integer():
-        return int(l)
+    # (not with math.log2: a float has 53 bits, so 2**96 + 1 or 2**160 - 1
+    # would be powers of 2)
+    if num & (num - 1):
+        return None
 
-    return None
+    return num.bit_length() - 1
 
 
 def padded_hex(given_int, given_len):
-    if given_int >= 0:
-        hex_result = hex(given_int)[2:]  # remove '0x' from beginning of str
-    else:
-        hex_result = hex(given_int)[3:]  # remove '0x' from beginning of str
+    if given_int < 0:
+        # a word written as the negative number it is (see simplify_exp):
+        # the digits of the word - its given_len lowest ones
+        given_int %= 16**given_len
+    hex_result = hex(given_int)[2:]  # remove '0x' from beginning of str
 
     num_hex_chars = len(hex_result)
     extra_zeros = "0" * (given_len - num_hex_chars)  # may not get used..
@@ -509,11 +541,16 @@ def find_f_set(exp, f):
 
 
 def find_f_list(exp, f, default=None):
-    ret = f(exp) or []
-
-    if type(exp) in (list, tuple):
-        for e in exp:
-            ret.extend(find_f_list(e, f))
+    # (what f finds in exp and in everything in it, in that order - walked
+    # in a loop rather than recursively: a trace's ifs can be nested deeper
+    # than python's recursion limit)
+    ret = []
+    todo = [exp]
+    while todo:
+        exp = todo.pop()
+        ret.extend(f(exp) or [])
+        if type(exp) in (list, tuple):
+            todo.extend(reversed(exp))
 
     return ret
 
@@ -568,15 +605,53 @@ def contains(exp, what):
     return False
 
 
+_keep_widths = []
+
+
+def keep_widths(old, new):
+    """see memloc.keep_widths: the operands that are bytes as wide as they were"""
+    if not _keep_widths:
+        from panoramix.core.memloc import keep_widths as k
+
+        _keep_widths.append(k)
+    return _keep_widths[0](old, new)
+
+
 def replace_f(in_exp, f):
+    """
+    in_exp with f applied to each of its expressions, from the innermost
+    out. What's bytes in it stays as wide as it was (see memloc.keep_widths).
+    """
     if type(in_exp) not in (tuple, list):
         in_exp = f(in_exp)
         return in_exp
 
     keep_type = type(in_exp)
     res = keep_type(replace_f(e, f) for e in in_exp)
+    if all(a is b for a, b in zip(res, in_exp)):
+        res = in_exp
+    elif keep_type is tuple:
+        res = keep_widths(in_exp, res)
 
     return f(res)
+
+
+def replace_vars(exp, values):
+    """
+    exp with each variable ("var", i) of `values` ({i: value}) replaced by
+    its value - all at once, as the setvars of a continue happen: a value
+    that has another of them keeps it (`s = s + k, k = k + 1` makes s + k
+    of s, not s + k + 1).
+    """
+    if not values:
+        return exp
+
+    def f(e):
+        if type(e) is tuple and len(e) == 2 and e[0] == "var" and e[1] in values:
+            return values[e[1]]
+        return e
+
+    return replace_f(exp, f)
 
 
 def replace(in_exp, what, by_what):
@@ -592,6 +667,9 @@ def replace(in_exp, what, by_what):
 
     if type(in_exp) == list:
         res = list(res)
+    elif res != in_exp:
+        # (what's bytes in it as wide as it was, as with replace_f)
+        res = keep_widths(in_exp, res)
 
     return res
 
@@ -612,6 +690,8 @@ def replace_f_stop(in_exp, f):
 
     if type(in_exp) == list:
         res = list(res)
+    elif res != in_exp:
+        res = keep_widths(in_exp, res)
 
     return res
 

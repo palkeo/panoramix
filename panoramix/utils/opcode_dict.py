@@ -39,6 +39,7 @@ opcode_dict = {
     0x1B: "shl",
     0x1C: "shr",
     0x1D: "sar",
+    0x1E: "clz",
     #
     # Sha3
     #
@@ -74,6 +75,8 @@ opcode_dict = {
     0x46: "chainid",
     0x47: "selfbalance",
     0x48: "basefee",
+    0x49: "blobhash",
+    0x4A: "blobbasefee",
     #
     # Stack, Memory, Storage and Flow Operations
     #
@@ -89,6 +92,9 @@ opcode_dict = {
     0x59: "msize",
     0x5A: "gas",
     0x5B: "jumpdest",
+    0x5C: "tload",
+    0x5D: "tstore",
+    0x5E: "mcopy",
     #
     # Push Operations
     #
@@ -207,6 +213,7 @@ stack_diffs = {
     "shl": -1,
     "shr": -1,
     "sar": -1,
+    "clz": 0,
     "blockhash": 0,
     "coinbase": 1,
     "selfdestruct": -1,
@@ -230,6 +237,11 @@ stack_diffs = {
     "address": 1,
     "selfbalance": 1,
     "basefee": 1,
+    "blobhash": 0,
+    "blobbasefee": 1,
+    "tload": 0,
+    "tstore": -2,
+    "mcopy": -3,
     "chainid": 1,
     "call": -6,
     "callcode": -6,
@@ -273,6 +285,7 @@ stack_diffs = {
     "revert": -2,
     "assert_fail": 0,
     "push": 1,
+    "push0": 1,
     "dup": 1,
     "swap": 0,
     "push1": 1,

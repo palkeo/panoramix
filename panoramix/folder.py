@@ -15,6 +15,9 @@ from panoramix.utils.helpers import (
     ENDC,
     FAIL,
     car,
+    contains,
+    find_f_list,
+    get_op,
     opcode,
     replace_f,
 )
@@ -127,12 +130,22 @@ def fold(trace):
         """
         log = fold_aux(log)
 
+        assert not find_f_list(log, lambda e: [e] if opcode(e) == MERGED_IF else [])
+
         return log
 
     except Exception:
         # make folder fail gracefuly
         logger.exception(f"folder failed in a function.")
         return trace
+
+
+# An 'if' whose branches join again (see vm.merge_branches) is folded by
+# as_paths on its own, branch by branch, and carried through the folding of
+# the surrounding paths as a single opaque line under this opcode. fold_aux
+# turns it back into a regular 'if' - it's the only place that knows it
+# shouldn't fold the branches again, folding isn't idempotent.
+MERGED_IF = "merged_if"
 
 
 def make_fands(exp):
@@ -157,16 +170,27 @@ def unmake_fands(exp):
 def as_paths(trace, path=None):
     assert type(trace) == list
 
+    if path is None:
+        # (all of it, the branches too: not again for each branch - a
+        # trace's lines over and over, as deep as its ifs nest)
+        trace = replace_f(trace, make_fands)
+
     path = path or tuple()
 
     #    self.find_offsets()
 
-    trace = replace_f(trace, make_fands)
-
-    for line in trace:
+    for idx, line in enumerate(trace):
         if opcode(line) == "if":
-            # assumes 'ifs' end trace
             cond, if_true, if_false = line[1], line[2], line[3]
+
+            if idx + 1 < len(trace):
+                # The branches merge again and the trace goes on after the if
+                # (see vm.merge_branches). Fold each branch on its own and
+                # keep the if as a single line - unfolding it would double
+                # the number of paths, which is what merging avoided.
+                path += ((MERGED_IF, cond, fold(if_true), fold(if_false)),)
+                continue
+
             return as_paths(if_true, path + (cond,)) + as_paths(
                 if_false, path + (is_zero(cond),)
             )
@@ -203,6 +227,7 @@ TERMINATING = (
     "revert",
     "continue",
     "undefined",
+    "leave",
 )
 
 
@@ -215,12 +240,19 @@ def fold_aux(trace):
 
     for idx, line in enumerate(trace):
         if opcode(line) == "while":
-            cond, trace, jds, setvars = line[1:]
+            cond, body, jds, setvars = line[1:]
 
-            trace = fold(trace)
-            line = ("while", cond, trace, jds, setvars)
+            body = fold(body)
+            line = ("while", cond, body, jds, setvars)
 
             out.append(line)
+
+        elif opcode(line) == MERGED_IF:
+            # the branches are folded already
+            _, cond, if_true, if_false = line
+            lines, merged = try_merge_ifs(cond, if_true, if_false)
+            out.extend(lines)
+            out.extend(join_if(*merged[1:]))
 
         elif opcode(line) == "if":
             if m := match(line, ("if", ":cond", ":if_true")):
@@ -229,7 +261,7 @@ def fold_aux(trace):
                 last_true = if_true[-1] if if_true else None
                 if (
                     if_false == [("return", 0)]
-                    or if_false == [("revert", 0)]
+                    or if_false == [("revert", None)]
                     or opcode(car(if_false)) == "invalid"
                 ):  # and\
                     if (
@@ -254,23 +286,7 @@ def fold_aux(trace):
                 if_true = fold_aux(if_true)
                 if_false = fold_aux(if_false)
 
-                if (
-                    len(if_true) > 0
-                    and len(if_false) > 0
-                    and len(if_true) > 0
-                    and opcode(if_true[-1]) in TERMINATING
-                    and opcode(car(if_false)) not in ("invalid", "revert")
-                ):
-                    # ^ should be some more generic check that all if_true
-                    #   paths end with exit
-
-                    line = ("if", cond, if_true)
-                    out.append(line)
-                    out.extend(if_false)
-
-                else:
-                    line = ("if", cond, if_true, if_false)
-                    out.append(line)
+                out.extend(join_if(cond, if_true, if_false))
             else:
                 assert False, line
 
@@ -278,6 +294,29 @@ def fold_aux(trace):
             out.append(line)
 
     return out
+
+
+def join_if(cond, if_true, if_false):
+    # `if_true` and `if_false` went through fold_aux already
+    if not if_true and not if_false:
+        return []
+
+    if not if_true:
+        cond, if_true, if_false = is_zero(cond), if_false, []
+
+    if not if_false:
+        return [("if", cond, if_true)]
+
+    if opcode(if_true[-1]) in TERMINATING and opcode(car(if_false)) not in (
+        "invalid",
+        "revert",
+    ):
+        # ^ should be some more generic check that all if_true
+        #   paths end with exit
+
+        return [("if", cond, if_true)] + if_false
+
+    return [("if", cond, if_true, if_false)]
 
 
 """
@@ -443,6 +482,7 @@ def flatten(path):
             "revert",
             "continue",
             "undefined",
+            "leave",
         ):
             return True
         elif opcode(line) == "or":
@@ -497,6 +537,13 @@ def try_merge(one, two):
         idx += 1
 
     idx -= 1
+
+    # (the line after a one-sided or is the guard of what follows it, that
+    # cleanup_ors skips: it stays with its or)
+    while idx > 0 and any(
+        opcode(x[-idx - 1]) == "or" and len(x[-idx - 1]) == 2 for x in (one, two)
+    ):
+        idx -= 1
 
     if idx > 0:
         return [("or", one[:-idx], two[:-idx])] + one[-idx:]
@@ -563,9 +610,73 @@ def make_ifs(path):
     return ret
 
 
+# what the lines moved out of an if may change, that its condition reads
+STATE_READS = (
+    "st",
+    "sall",
+    "storage",
+    "stor",
+    "mem",
+    "var",
+    "tload",
+    "balance",
+    "extcodesize",
+    "extcodehash",
+)
+STATE_SYMBOLS = (
+    "ext_call",
+    "return_data",
+    "returndatasize",
+    "return_code",
+    "new_address",
+    ".result",
+    "memcopy",
+    "gas",
+    "msize",
+)
+
+
+def reads_state(exp, reads=STATE_READS):
+    """whether exp reads what a line may change: storage, memory, a variable..."""
+    if type(exp) == str:
+        return any(k in exp for k in STATE_SYMBOLS)
+    if type(exp) in (tuple, list):
+        return opcode(exp) in reads or any(reads_state(e, reads) for e in exp)
+    return False
+
+
+def changes_read(line, cond):
+    """whether the line may change what cond reads"""
+    if contains(cond, "gas") or contains(cond, "msize"):
+        # (the gas left, the size of the memory: any line may change them)
+        return True
+    op = opcode(line)
+    if op == "setvar":
+        return contains(cond, ("var", line[1]))
+    if op == "setmem":
+        return get_op(cond, "mem") is not None
+    if op == "store":
+        return any(get_op(cond, k) is not None for k in ("st", "sall", "storage", "stor"))
+    if op == "if":
+        # (one-sided, or with an else)
+        return any(changes_read(l, cond) for branch in line[2:] for l in branch)
+    if type(line) == str or op in ("log", "jd") or op in TERMINATING:
+        return False
+    if op in ("call", "staticcall", "delegatecall", "callcode", "create", "create2"):
+        # (the state, the memory, what it returns - not a variable)
+        return reads_state(cond, tuple(r for r in STATE_READS if r != "var"))
+    return reads_state(cond)
+
+
 def try_merge_ifs(cond, if_true, if_false):
+    # the lines both branches begin with go before the if - before its
+    # condition is evaluated: up to one that may change what it reads
     idx = 0
-    while idx < min(len(if_true), len(if_false)) and if_true[idx] == if_false[idx]:
+    while (
+        idx < min(len(if_true), len(if_false))
+        and if_true[idx] == if_false[idx]
+        and not changes_read(if_true[idx], cond)
+    ):
         idx += 1
 
     assert if_true[:idx] == if_false[:idx]
@@ -599,6 +710,12 @@ def merge_ifs(path):
                 merge_ifs(line[2]),
                 merge_ifs(path[idx + 1 :]),
             )
+            if not if_true or opcode(if_true[-1]) not in TERMINATING:
+                # what follows the if runs after its body too: it's not an
+                # else, nothing of the two is the same code
+                ret.append(("if", cond, if_true))
+                ret.extend(if_false)
+                break
             lines, merged = try_merge_ifs(cond, if_true, if_false)
             ret.extend(lines)
             ret.append(merged[:3])
@@ -616,6 +733,214 @@ def merge_ifs(path):
 
 
 def fold_paths(for_merge):
+    """
+    fold_path_lists, on stretches of the paths rather than on copies of
+    them: the paths of a level of its recursion are the lines start to
+    len(path) - trim of each - for all of them the same start and trim,
+    each level taking the same lines off the beginnings or off the ends of
+    all its paths. Copying what's left of the paths at each level took a
+    trace whose ifs nest n deep (n paths of up to n lines, each level a line
+    less) n**3 of the time and of the memory: minutes for a few hundred
+    levels, more memory than there is past a thousand.
+
+    The paths with a line that's a list or an or (or_op and and_op would
+    expand it - as_paths makes none, see make_fands) are folded as lists.
+    """
+    for path in for_merge:
+        for line in path:
+            if type(line) == list or opcode(line) == "or":
+                return fold_path_lists(for_merge)
+
+    return _fold_stretches(for_merge, 0, 0)
+
+
+def _fold_stretches(paths, start, trim):
+    """fold_path_lists of [path[start : len(path) - trim] for path in paths]"""
+    if len(paths) == 0:
+        return []
+
+    if len(paths) == 1:
+        return paths[0][start : len(paths[0]) - trim]
+
+    paths.sort(key=lambda r: -len(r))
+
+    # the lines all the paths begin with, as the first (the longest) does,
+    # and those they all end with - all of it at most
+    first = paths[0]
+    f_end = len(first) - trim
+
+    begin = 0
+    while begin < f_end - start and all(
+        len(path) - trim - start > begin
+        and (
+            path[start + begin] is first[start + begin]
+            or path[start + begin] == first[start + begin]
+        )
+        for path in paths
+    ):
+        begin += 1
+
+    end = 0
+    while end < f_end - start and all(
+        len(path) - trim - start > end
+        and (
+            path[len(path) - trim - 1 - end] is first[f_end - 1 - end]
+            or path[len(path) - trim - 1 - end] == first[f_end - 1 - end]
+        )
+        for path in paths
+    ):
+        end += 1
+
+    output = first[start : start + begin]
+    ending = first[f_end - end : f_end]
+
+    # the paths without them (those too short for both, without the
+    # beginning, aren't in the or)
+    start += begin
+    if end > 0:
+        paths = [path for path in paths if len(path) - trim - start >= end]
+        trim += end
+
+    ors, rest = _fold_or_stretches(sorted(paths, key=len), start, trim)
+
+    output.append(ors)
+    output += rest
+    output += ending
+
+    return output
+
+
+def _fold_or_stretches(sides, start, trim):
+    """
+    fold_or of ("or",) + the stretches of the sides (sorted by length): the
+    or, and what's left folded (fold_or's paths, through fold_paths)
+    """
+    if len(sides) < 2 or len(sides[0]) - trim == start:
+        # (an empty side, or a single one: fold_or fails)
+        return _fold_or_listed(sides, start, trim)
+
+    longest = sides[-1]
+    l0 = longest[start]
+    i = 0
+    while l0 == sides[i][start]:
+        i += 1
+        if i == len(sides):
+            # (they all begin alike: fold_or fails)
+            return _fold_or_listed(sides, start, trim)
+
+    shortest = sides[i]
+    s0 = shortest[start]
+
+    if not l0 != s0 or any(side[start] not in (l0, s0) for side in sides):
+        # (another first line: fold_or fails)
+        return _fold_or_listed(sides, start, trim)
+
+    # the sides beginning with the shortest's first line, and the others,
+    # with the longest's
+    a_sides = [side for side in sides if side[start] is s0 or side[start] == s0]
+
+    best = None
+    if 2 * len(a_sides) == len(sides):
+        b_sides = [
+            side for side in sides if not (side[start] is s0 or side[start] == s0)
+        ]
+        best = _split_stretches(a_sides, b_sides, shortest, longest, start, trim)
+
+    if best is not None:
+        idx1, idx2 = best
+        ors = or_op(shortest[start : start + idx1], longest[start : start + idx2])
+        return ors, _fold_stretches(a_sides, start + idx1, trim)
+
+    # cut the first line, merge the remaining paths if possible
+    b_sides = [side for side in sides if side[start] is l0 or side[start] == l0]
+
+    s1 = _fold_stretches(a_sides, start + 1, trim)
+    s2 = _fold_stretches(b_sides, start + 1, trim)
+
+    shorter_path = and_op(s0, s1)
+    longer_path = and_op(l0, s2)
+
+    return ("or",) + (shorter_path,) + (longer_path,), []
+
+
+def _split_stretches(a_sides, b_sides, shortest, longest, start, trim):
+    """
+    fold_or's two longest stretches, idx1 lines of the shortest and idx2 of
+    the longest, that split the or in two: the first pair (idx1, then idx2)
+    for which the sides beginning with those lines are all of them, as many
+    of each, with the same rest after them. Without trying each pair (the
+    sides beginning with every beginning of the shortest, then with those
+    of the longest):
+
+    The sides beginning with the shortest's first line are those of
+    a_sides, the others b_sides', so there must be as many of each, and
+    the k-th of each must have the same rest: idx2 - idx1 is the
+    difference d of their lengths, the same for all k. idx1 is then at
+    most the lines all of a_sides share with the shortest (and idx1 + d
+    those all of b_sides share with the longest), and at least where each
+    pair begins to end alike, in the side of a_sides (the rest after it the
+    same, the rest after the next ones too): the first idx1 is that.
+    """
+    s_len = len(shortest) - trim - start
+    l_len = len(longest) - trim - start
+
+    d = len(b_sides[0]) - len(a_sides[0])
+    for a, b in zip(a_sides, b_sides):
+        if len(b) - len(a) != d:
+            return None
+
+    hi_a = 0
+    while hi_a < s_len and all(
+        len(a) - trim - start > hi_a
+        and (
+            a[start + hi_a] is shortest[start + hi_a]
+            or a[start + hi_a] == shortest[start + hi_a]
+        )
+        for a in a_sides
+    ):
+        hi_a += 1
+
+    hi_b = 0
+    while hi_b < l_len and all(
+        len(b) - trim - start > hi_b
+        and (
+            b[start + hi_b] is longest[start + hi_b]
+            or b[start + hi_b] == longest[start + hi_b]
+        )
+        for b in b_sides
+    ):
+        hi_b += 1
+
+    lo = max(1, 1 - d)
+    hi = min(hi_a, s_len - 1, l_len - 1 - d, hi_b - d)
+    for a, b in zip(a_sides, b_sides):
+        if lo > hi:
+            return None
+        a_end, b_end = len(a) - trim, len(b) - trim
+        # (the lines past lo end alike, or lo is past it)
+        n = min(a_end - start - lo, b_end - start)
+        i = 0
+        while i < n and (
+            a[a_end - 1 - i] is b[b_end - 1 - i] or a[a_end - 1 - i] == b[b_end - 1 - i]
+        ):
+            i += 1
+        if i < a_end - start - lo:
+            lo = a_end - start - i
+
+    if lo > hi:
+        return None
+
+    return lo, lo + d
+
+
+def _fold_or_listed(sides, start, trim):
+    """_fold_or_stretches as fold_or does it, on copies of the sides"""
+    line = ("or",) + tuple(side[start : len(side) - trim] for side in sides)
+    ors, paths = fold_or(line)
+    return ors, fold_paths(paths)
+
+
+def fold_path_lists(for_merge):
     if len(for_merge) == 0:
         return []
 
@@ -657,64 +982,60 @@ def fold_paths(for_merge):
             output.append(line)
 
         else:
-
-            def fold_or(line):
-                longest = line[-1]
-
-                i = 1
-                while longest[0] == line[i][0]:
-                    i += 1
-
-                shortest = line[i]
-
-                assert longest[0] != shortest[0], (longest, shortest)
-
-                for l in line[1:]:
-                    if l[0] in (longest[0], shortest[0]):
-                        pass
-                    else:
-                        pprint_logic(shortest)
-                        print()
-                        pprint_logic(longest)
-                        print()
-                        pprint_logic(l[0])
-                        raise
-                #                        , (longest[0], shortest[0], l[0])
-
-                # find two longest stretches that split the line or into exactly two parts
-
-                best = None
-
-                for idx1 in range(1, len(shortest)):
-                    s1 = starting_with(line, shortest[:idx1])
-                    for idx2 in range(1, len(longest)):
-                        s2 = starting_with(line, longest[:idx2])
-                        if (
-                            best is None
-                            and s1 == s2
-                            and len(s1) + len(s2) + 1 == len(line)
-                        ):
-                            best = (idx1, idx2)
-                            best_s = s1
-
-                if best is not None:
-                    return or_op(shortest[: best[0]], longest[: best[1]]), best_s
-
-                # cut the first line, merge the remaining paths if possible
-                s1 = starting_with(line, [shortest[0]])
-                s2 = starting_with(line, [longest[0]])
-
-                s1 = fold_paths(s1)
-                s2 = fold_paths(s2)
-
-                shorter_path = and_op(shortest[0], s1)
-                longer_path = and_op(longest[0], s2)
-
-                return ("or",) + (shorter_path,) + (longer_path,), []
-
             ors, paths = fold_or(line)
 
             output.append(ors)
             output += fold_paths(paths)
 
     return output
+
+
+def fold_or(line):
+    longest = line[-1]
+
+    i = 1
+    while longest[0] == line[i][0]:
+        i += 1
+
+    shortest = line[i]
+
+    assert longest[0] != shortest[0], (longest, shortest)
+
+    for l in line[1:]:
+        if l[0] in (longest[0], shortest[0]):
+            pass
+        else:
+            pprint_logic(shortest)
+            print()
+            pprint_logic(longest)
+            print()
+            pprint_logic(l[0])
+            raise
+    #                        , (longest[0], shortest[0], l[0])
+
+    # find two longest stretches that split the line or into exactly two parts
+
+    best = None
+
+    for idx1 in range(1, len(shortest)):
+        s1 = starting_with(line, shortest[:idx1])
+        for idx2 in range(1, len(longest)):
+            s2 = starting_with(line, longest[:idx2])
+            if best is None and s1 == s2 and len(s1) + len(s2) + 1 == len(line):
+                best = (idx1, idx2)
+                best_s = s1
+
+    if best is not None:
+        return or_op(shortest[: best[0]], longest[: best[1]]), best_s
+
+    # cut the first line, merge the remaining paths if possible
+    s1 = starting_with(line, [shortest[0]])
+    s2 = starting_with(line, [longest[0]])
+
+    s1 = fold_paths(s1)
+    s2 = fold_paths(s2)
+
+    shorter_path = and_op(shortest[0], s1)
+    longer_path = and_op(longest[0], s2)
+
+    return ("or",) + (shorter_path,) + (longer_path,), []

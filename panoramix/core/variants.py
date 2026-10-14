@@ -1,4 +1,4 @@
-from panoramix.utils.helpers import is_array, opcode
+from panoramix.utils.helpers import clear_caches, is_array, opcode
 
 """
 
@@ -16,6 +16,20 @@ from panoramix.utils.helpers import is_array, opcode
 
 MAX_number = 2**230 - 1
 MAX_number2 = 2**230 - 1
+
+# Whether mem[64] is the free memory pointer of solidity, which it sets to
+# 0x80 (0x60 before 0.4.22) before anything else: then it's at least 0x60
+# (see Loader.load_binary). Vyper's mem[64] is a word like another, a length
+# say.
+FREE_MEMORY_POINTER = True
+
+
+def set_free_memory_pointer(on):
+    global FREE_MEMORY_POINTER
+    if on != FREE_MEMORY_POINTER:
+        FREE_MEMORY_POINTER = on
+        # (what was decided with the other assumption)
+        clear_caches()
 
 
 def variants(exp):
@@ -80,13 +94,11 @@ def possibilities(var):
             yield {current: MAX_number}
             yield {current: MAX_number2}
 
-            if current == ("mem", ("range", 64, 32)):
+            if current == ("mem", ("range", 64, 32)) and FREE_MEMORY_POINTER:
                 yield {current: 96}
-            elif current == "calldatasize":
-                yield {
-                    current: 6
-                }  # nasty hack for `sweeper` contract, try to remove and see what happens
-            else:  # can theoretically cause bugs in other ones
+            else:
+                # (calldatasize too: a call has 0 to 3 bytes of data, the
+                # sweeper contract's fallback say)
                 yield {current: 0}
 
         else:
@@ -96,27 +108,21 @@ def possibilities(var):
                 p[current] = MAX_number2
                 yield p
 
-                if current == ("mem", ("range", 64, 32)):
-                    yield {current: 96}
-                elif current == "calldatasize":
-                    p[current] = 6
+                if current == ("mem", ("range", 64, 32)) and FREE_MEMORY_POINTER:
+                    p[current] = 96
                 else:
                     p[current] = 0
                 yield p
 
 
-def replace(exp, idx, val):
-    if exp == idx:
-        return val
+def replace_dict(exp, dic):
+    # All the variables at once: one can contain another (mem[_1] and _1),
+    # replacing them one after the other would depend on their order.
+    for idx, val in dic.items():
+        if exp == idx:
+            return val
 
     if type(exp) != tuple:
         return exp
 
-    return tuple(replace(e, idx, val) for e in exp)
-
-
-def replace_dict(exp, dic):
-    for idx, val in dic.items():
-        exp = replace(exp, idx, val)
-
-    return exp
+    return tuple(replace_dict(e, dic) for e in exp)
