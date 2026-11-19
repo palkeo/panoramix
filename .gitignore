@@ -1,3 +1,4 @@
+#>_*.gitgnore
 __pycache__/
 cache
 .DS_Store
